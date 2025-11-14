@@ -1,326 +1,322 @@
-package actor
+package decision
 
 import (
-	"game/comps/ai"
-	"game/comps/anim"
-	"game/comps/body"
-	"game/comps/hitbox"
-	"game/comps/stats"
-	"game/core"
-	"game/libs/bump"
-	"game/vars"
-	"image/color"
-	"log"
-	"math"
-	"slices"
-	"strings"
+	"time"
+
+	"game/components"
+	"game/ecs"
+	"game/entities"
+	"game/pkg/config"
+	"game/systems/update/entities/animation"
+
+	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/inpututil"
 )
 
-const (
-	dieSeconds   = 1
-	flashSeconds = 0.05
-)
+const playerBufferWindow = 500 * time.Millisecond
 
-var DieParticle func(core.Entity) core.Entity
+// ══════════════════════════════════════════════════════════════════════════════
+// PLAYER GUARD FUNCTIONS
+// Consolidated from player_guard.go during Phase 8 refactor (10/30/2025)
+// ══════════════════════════════════════════════════════════════════════════════
 
-type Actor interface {
-	core.Entity
-	Comps() (anim *anim.Comp, body *body.Comp, hitbox *hitbox.Comp, stats *stats.Comp, ai *ai.Comp)
-}
+// processPlayerGuard handles blocking state transitions for the player entity.
+// Pure ECS implementation - replaces Control.ShieldUp/ShieldDown/BlockingState.
+//
+// Blocking mechanics:
+//   - ShieldUp adds a ParryBlock hitbox and reduces movement speed
+//   - ShieldDown removes the block hitbox and restores normal movement
+//   - BlockingState prevents facing direction changes while guarding
+//
+// Note: Sprite overlap with enemies during blocking is a visual artifact of the block hitbox
+// extending beyond the player sprite. This is intentional for gameplay feel. Modifying
+// Transform.W causes collision system desync and breaks ground collision.
+//
+// Implementation note: playerEnterBlock is called every frame while ShieldHeld is true.
+// It checks if already blocking with hitbox present before applying changes to avoid
+// flickering caused by repeatedly calling SetStateEffect (which restores then re-applies
+// the stat modifications each call). The hitbox is verified by checking BoxCount and
+// ContactType to ensure it's present throughout the blocking duration.
+func processPlayerGuard(anim *components.Animation, hitbox *components.Hitbox, stamina *components.Stamina, physics *components.Physics, intents *components.ActionIntents) {
+	currentlyBlocking := playerIsBlocking(anim)
 
-type Control struct {
-	actor                Actor
-	anim                 *anim.Comp
-	body                 *body.Comp
-	hitbox               *hitbox.Comp
-	stats                *stats.Comp
-	ai                   *ai.Comp
-	Paused               bool
-	dieTimer, flashTimer float64
-}
-
-func NewControl(a Actor) *Control {
-	c := &Control{actor: a, dieTimer: dieSeconds}
-	c.anim, c.body, c.hitbox, c.stats, c.ai = a.Comps()
-
-	return c
-}
-
-func (c *Control) Init() {
-	hurtbox, err := c.anim.FrameSlice(vars.HurtboxSliceName)
-	if err != nil {
-		log.Panicf("actor: no hurtbox found: %s", err)
-	}
-	c.hitbox.PushHitbox(hurtbox, hitbox.Hit, nil)
-	c.hitbox.HitFunc = func(other core.Entity, _ *bump.Collision, damage float64, contactType hitbox.ContactType) {
-		switch contactType {
-		case hitbox.Hit:
-			c.Hurt(other, damage, vars.DefaultReactForce)
-		case hitbox.Block, hitbox.ParryBlock:
-			c.Block(other, damage, vars.DefaultReactForce, contactType)
+	// Remove shield hitbox during consume animation (but don't change animation state)
+	if anim.State == components.ConsumeTag {
+		if currentlyBlocking && len(hitbox.Boxes) > 0 {
+			// Just remove hitbox, let heal animation handle state
+			hitbox.Boxes = hitbox.Boxes[:len(hitbox.Boxes)-1]
 		}
-	}
-}
-
-func (c *Control) SimpleUpdate(dt float64) {
-	if c.stats.Health <= 0 {
-		c.Die(dt)
-
-		return
-	}
-	c.anim.ColorScale = color.White
-	if c.flashTimer -= dt; c.flashTimer > 0 {
-		c.anim.ColorScale = anim.WhiteScalerColor
-	}
-	c.stats.Pause = c.PausingState()
-	if state := c.anim.State; state == vars.IdleTag || state == vars.WalkTag {
-		nextState := vars.IdleTag
-		if c.body.Vx != 0 {
-			nextState = vars.WalkTag
-		}
-		c.anim.SetState(nextState)
-		if c.ai != nil && c.ai.Target != nil {
-			tx, _, tw, _ := c.ai.Target.Rect()
-			x, _, w, _ := c.actor.Rect()
-			c.anim.FlipX = tx+tw/2 > x+w/2
-		}
-	}
-}
-
-func (c *Control) Hurt(other core.Entity, damage, reactForce float64) {
-	// TODO: Figure out force stuff here. For Block() too.
-	c.ShieldDown()
-	c.stats.AddPoise(-damage)
-	c.stats.AddHealth(-damage)
-
-	force := reactForce
-	ax, _ := c.actor.Position()
-	if ox, _ := other.Position(); ax < ox {
-		force *= -1
-	}
-
-	c.body.Vx += force
-	if c.stats.Poise <= 0 || c.anim.State == vars.ConsumeTag {
-		force *= 2 * (damage / c.stats.MaxHealth)
-		c.Stagger(force, false, 1)
-	}
-	c.flashTimer = flashSeconds
-
-	if c.ai != nil && c.ai.Target == nil {
-		c.ai.Target = other
-	}
-}
-
-func (c *Control) Block(other core.Entity, damage, reactForce float64, contactType hitbox.ContactType) {
-	c.stats.AddHealth(-damage / 10)
-	c.stats.AddStamina(-damage)
-	if contactType == hitbox.ParryBlock {
 		return
 	}
 
-	force := reactForce / 2
-	ax, _ := c.actor.Position()
-	if ox, _ := other.Position(); ax < ox {
-		force *= -1
+	// Process shield held state
+	if intents.ShieldHeld {
+		// Enter/maintain blocking state
+		// Always call playerEnterBlock to ensure animation and effects are properly set
+		// even if animation FSM caused a transition away from blocking states
+		playerEnterBlock(anim, hitbox, stamina, physics)
+	} else {
+		// Exit blocking state if currently blocking
+		if currentlyBlocking {
+			playerExitBlockWithStamina(anim, hitbox, stamina, physics)
+		}
 	}
 
-	c.body.Vx += force
-	if c.stats.Stamina < 0 {
-		force *= 2 * (damage / c.stats.MaxHealth)
-		c.Stagger(force, false, 2)
+	// Process explicit shield release (takes priority)
+	if intents.ShieldRelease {
+		if currentlyBlocking {
+			playerExitBlockWithStamina(anim, hitbox, stamina, physics)
+		}
+		intents.ShieldRelease = false // Clear flag
 	}
 }
 
-func (c *Control) Die(dt float64) {
-	c.Paused = true
-	c.Stagger(0, false, 1)
-	const minAlpha = 50
-	if c.dieTimer -= dt; c.dieTimer > 0 {
-		alpha := uint8(minAlpha + (math.MaxUint8-minAlpha)*c.dieTimer/dieSeconds)
-		c.anim.ColorScale = color.RGBA{alpha, alpha, alpha, alpha}
+// playerIsBlocking reports whether the player is currently blocking (Pure ECS - replaces Control.BlockingState).
+func playerIsBlocking(anim *components.Animation) bool {
+	return anim.State == components.BlockTag || anim.State == components.ParryBlockTag
+}
 
+// playerEnterBlock enters blocking/parry state (Pure ECS - replaces Control.ShieldUp).
+// This function is idempotent and can be called every frame while blocking to maintain the state.
+//
+// KNOWN ISSUES:
+//   - Quick shield raise after lowering may fail to re-add hitbox in some timing scenarios
+//     (Timing between hitbox removal and re-detection can cause shield to not go up immediately)
+//   - Animation flickering may occur during rapid state transitions
+//
+// BLOCKING MECHANICS (WORKING AS DESIGNED):
+// - ParryBlock reduces damage to 10% (chip damage) - see player_block.go ApplyPlayerBlock()
+// - This is a 90% damage reduction, not a full block
+// - Example: 20 damage attack → 2 chip damage when blocking
+// - Also drains stamina and prevents knockback/stagger (unless stamina depleted)
+//
+// TODO: Add telemetry/logging to track hitbox add/remove cycles for debugging re-raise issue
+func playerEnterBlock(anim *components.Animation, hitbox *components.Hitbox, stamina *components.Stamina, physics *components.Physics) {
+	wasBlocking := playerIsBlocking(anim)
+
+	// Check if block hitbox already exists
+	// Search through all hitboxes to find a ParryBlock (not just the last one)
+	hasBlockHitbox := false
+	for i := 0; i < len(hitbox.Boxes); i++ {
+		if hitbox.Boxes[i].Contact == components.ParryBlock {
+			hasBlockHitbox = true
+			break
+		}
+	}
+
+	// If already blocking with hitbox present, nothing to do
+	if wasBlocking && hasBlockHitbox {
 		return
 	}
 
-	vars.World.Remove(c.actor)
-	if DieParticle != nil {
-		for range c.stats.Exp {
-			vars.World.Add(DieParticle(c.actor))
+	// Entering blocking for the first time OR re-entering after FSM transition or quick release
+	if !wasBlocking {
+		animation.SetAnimationState(anim, components.ParryBlockTag)
+	}
+
+	// Apply state effect (only when first entering or re-entering)
+	// This reduces movement speed and stamina recovery
+	animation.SetStateEffect(anim, func() func() {
+		prevMaxX := physics.MaxVelocity.X
+		prevStaminaRecoverRate := stamina.RecoveryRate
+
+		physics.MaxVelocity.X = prevMaxX / 2
+		stamina.RecoveryRate /= 3
+
+		return func() {
+			physics.MaxVelocity.X = prevMaxX
+			stamina.RecoveryRate = prevStaminaRecoverRate
 		}
-	}
-}
+	}, components.ParryBlockTag, components.BlockTag)
 
-func (c *Control) Attack(attackTag string, damage, staminaDamage, reactForce, pushForce float64) {
-	mult := 0.0
-	c.MultAttack(attackTag, damage, staminaDamage, reactForce, pushForce, &mult)
-}
-
-// TODO: This is a mess...
-func (c *Control) MultAttack(attackTag string, damage, staminaDamage, reactForce, pushForce float64, mult *float64) {
-	if c.PausingState() || c.stats.Stamina <= 0 {
-		return
-	}
-	damage *= 1 + c.stats.AttackMult
-	if strings.HasPrefix(c.anim.State, attackTag) && c.anim.Data.Animation(c.anim.State+"C") != nil {
-		attackTag = c.anim.State + "C"
-	}
-
-	c.ShieldDown()
-	c.anim.SetState(attackTag)
-	c.anim.SetStateEffect(func() func() {
-		c.Paused = true
-
-		return func() { c.Paused = false }
-	})
-
-	if c.anim.Data.Animation(attackTag+"C") != nil {
-		lastFrame := c.anim.Data.CurrentAnimation.To - c.anim.Data.CurrentAnimation.From
-		c.anim.OnFrame(lastFrame, func() { c.Paused = false })
-	}
-
-	var contactType hitbox.ContactType
-	var contacted []*hitbox.Comp
-	var shakeNum int
-	var once bool
-	c.anim.OnSlicePresent(vars.HitboxSliceName, func(slice bump.Rect, segmented bool) {
-		if segmented {
-			contacted = nil
-			shakeNum = 0
-		}
-		attackMult := *mult + 1
-		totalDamage := damage * attackMult
-		contactType, contacted = c.hitbox.HitFromHitBox(slice, totalDamage, contacted)
-		if c.actor == vars.Player && shakeNum != len(contacted) { // TODO: This is an ugly hack
-			shakeNum = len(contacted)
-			vars.World.Camera.Shake(0.1*float32(attackMult), 0.5*(attackMult))
-		}
-		if contactType == hitbox.ParryBlock {
-			if c.stats.AddPoise(-totalDamage); c.stats.Poise <= 0 {
-				c.Stagger(reactForce*(totalDamage/c.stats.MaxHealth), true, 1)
-			}
-		}
-		if !once {
-			once = true
-			c.stats.AddStamina(-staminaDamage * attackMult)
-			force := pushForce
-			if contactType >= hitbox.Block {
-				force = reactForce
-			}
-			if (contactType >= hitbox.Block && c.anim.FlipX) || (contactType < hitbox.Block && !c.anim.FlipX) {
-				force *= -1
-			}
-			c.body.Vx += force
-		}
-	})
-}
-
-func (c *Control) ShieldUp() {
-	if c.PausingState() || c.BlockingState() {
-		return
-	}
-	c.anim.SetState(vars.ParryBlockTag)
-	c.anim.SetStateEffect(func() func() {
-		prevMaxX, prevStaminaRecoverRate := c.body.MaxX, c.stats.StaminaRecoverRate
-		c.body.MaxX /= 2
-		c.stats.StaminaRecoverRate /= 3
-
-		return func() { c.body.MaxX, c.stats.StaminaRecoverRate = prevMaxX, prevStaminaRecoverRate }
-	}, vars.ParryBlockTag, vars.BlockTag)
-	blockSlice, err := c.anim.FrameSlice(vars.BlockSliceName)
-	if err != nil {
-		panic(err)
-	}
-	c.hitbox.PushHitbox(blockSlice, hitbox.ParryBlock, func() hitbox.ContactType {
-		if c.anim.State == vars.ParryBlockTag {
-			return hitbox.ParryBlock
-		}
-
-		return hitbox.Block
-	})
-}
-
-func (c *Control) ShieldDown() {
-	if !c.BlockingState() {
-		return
-	}
-	c.anim.SetState(vars.IdleTag)
-	c.hitbox.PopHitbox()
-}
-
-func (c *Control) PausingState() bool {
-	return c.Paused || slices.Contains([]string{vars.StaggerTag, vars.ConsumeTag}, c.anim.State)
-}
-
-func (c *Control) BlockingState() bool {
-	return c.anim.State == vars.BlockTag || c.anim.State == vars.ParryBlockTag
-}
-
-func (c *Control) CanJump() bool {
-	return c.stats.Stamina > 0 && (c.anim.State == vars.ClimbTag || c.body.Ground) && !c.BlockingState() && c.anim.State != vars.ConsumeTag
-}
-
-func (c *Control) ClimbOn(pressedDown bool) {
-	if c.PausingState() || c.anim.State == vars.ClimbTag {
-		return
-	}
-	if pressedDown {
-		if (c.body.Ground && c.body.InsidePassThrough) || !c.body.DropThrough() {
+	// Always ensure block hitbox is present when blocking
+	// This handles quick re-raise scenarios where hitbox might be missing
+	if !hasBlockHitbox {
+		// Get block hitbox from animation frame slice map
+		keys := anim.SliceMap[components.BlockSliceName]
+		if keys == nil {
+			// BUG: If we can't get the block slice, blocking won't work
+			// This can happen if animation doesn't have BlockSliceName defined
 			return
 		}
-	}
-	if !c.body.InsidePassThrough {
-		return
-	}
-	c.ShieldDown()
-	c.anim.SetState(vars.ClimbTag)
-	c.anim.SetStateEffect(func() func() {
-		prevWeight := c.body.Weight
-		c.body.Weight = 0
 
-		return func() { c.body.Weight = prevWeight }
-	})
-}
+		blockSlice, ok := keys[anim.Data.CurrentFrame]
+		if !ok {
+			// BUG: Slice not present on current frame
+			return
+		}
 
-func (c *Control) Stagger(force float64, moveBack bool, timeMult float64) {
-	c.ShieldDown()
-	c.anim.SetState(vars.StaggerTag)
-	if timeMult != 1 {
-		c.anim.SetStateEffect(func() func() {
-			prevPlaySpeed := c.anim.Data.PlaySpeed
-			c.anim.Data.PlaySpeed = float32(1.0 / timeMult)
-
-			return func() { c.anim.Data.PlaySpeed = prevPlaySpeed }
+		// Add parry block hitbox
+		hitbox.Boxes = append(hitbox.Boxes, components.HitboxRect{
+			X:       blockSlice.X,
+			Y:       blockSlice.Y,
+			W:       blockSlice.W,
+			H:       blockSlice.H,
+			Contact: components.ParryBlock,
 		})
 	}
-	if moveBack && c.anim.FlipX {
-		force *= -1
-	}
-	c.body.Vx += force
 }
 
-func (c *Control) ClimbOff() {
-	if c.anim.State != vars.ClimbTag {
+// playerExitBlockWithStamina exits blocking state (Pure ECS - replaces Control.ShieldDown).
+func playerExitBlockWithStamina(anim *components.Animation, hitbox *components.Hitbox, stamina *components.Stamina, physics *components.Physics) {
+	if !playerIsBlocking(anim) {
 		return
 	}
-	c.anim.SetState(vars.IdleTag)
+
+	// Exit blocking animation
+	animation.SetAnimationState(anim, components.IdleTag)
+
+	// Remove block hitbox (last added box)
+	if len(hitbox.Boxes) > 0 {
+		hitbox.Boxes = hitbox.Boxes[:len(hitbox.Boxes)-1]
+	}
 }
 
-func (c *Control) Heal() {
-	if c.PausingState() || c.stats.Heal <= 0 || !c.body.Ground {
+// ══════════════════════════════════════════════════════════════════════════════
+// PLAYER UPDATE SYSTEM
+// ══════════════════════════════════════════════════════════════════════════════
+
+func UpdatePlayer(world *ecs.World, dt float64) {
+	if world == nil {
 		return
 	}
-	c.ShieldDown()
-	c.anim.SetState(vars.ConsumeTag)
-	c.anim.SetStateEffect(func() func() {
-		prevMaxX := c.body.MaxX
-		c.body.MaxX /= 3
 
-		return func() { c.body.MaxX = prevMaxX }
-	})
-	c.anim.OnSlicePresent(vars.HealSliceName, func(_ bump.Rect, segmented bool) {
-		if segmented {
-			c.stats.AddHeal(-1)
+	cfg := ecs.Resource[config.Config](world)
+	if cfg == nil {
+		return
+	}
+
+	for _, eid := range world.EntitiesWith((*components.Player)(nil), (*components.ActionIntents)(nil)) {
+		player := ecs.GetComponent[components.Player](world, eid)
+		intents := ecs.GetComponent[components.ActionIntents](world, eid)
+		facing := ecs.GetComponent[components.Facing](world, eid)
+		anim := ecs.GetComponent[components.Animation](world, eid)
+		health := ecs.GetComponent[components.Health](world, eid)
+		stamina := ecs.GetComponent[components.Stamina](world, eid)
+		healing := ecs.GetComponent[components.Healing](world, eid)
+		input := ecs.GetComponent[components.Input](world, eid)
+		physics := ecs.GetComponent[components.Physics](world, eid)
+		if player == nil || intents == nil || facing == nil || anim == nil || health == nil || stamina == nil || healing == nil || input == nil || physics == nil {
+			continue
 		}
-	})
-	c.anim.OnFrame(3, func() { c.stats.AddHeal(-1) }) // TODO: Add "healbox" slice to player anim file and delete this line
+		if !playerReady(anim, health, stamina, intents, physics) {
+			continue
+		}
+
+		// Initialize player hurtbox from animation data if needed
+		initPlayerHurtbox(world, eid)
+
+		// Process player guard/blocking state (consolidated from player_guard.go)
+		hitbox := ecs.GetComponent[components.Hitbox](world, eid)
+		if hitbox != nil {
+			processPlayerGuard(anim, hitbox, stamina, physics, intents)
+		}
+
+		// Get transform for collision operations
+		transform := ecs.GetComponent[components.Transform](world, eid)
+
+		if health.Current > 0 {
+			applyPlayerInput(world, eid, player, intents, facing, anim, health, stamina, healing, transform, dt, cfg)
+			heavyAttackTick(player, anim, input) // Moved from Player method
+		}
+	}
+}
+
+func playerReady(anim *components.Animation, health *components.Health, stamina *components.Stamina, intents *components.ActionIntents, physics *components.Physics) bool {
+	return anim != nil && health != nil && stamina != nil && intents != nil && physics != nil
+}
+
+func applyPlayerInput(world *ecs.World, eid entities.EntityId, player *components.Player, intents *components.ActionIntents, facing *components.Facing, anim *components.Animation, health *components.Health, stamina *components.Stamina, healing *components.Healing, transform *components.Transform, dt float64, cfg *config.Config) {
+	if intents == nil {
+		return
+	}
+	if !canProcessInput(anim) {
+		// Clear intents during consume animation
+		intents.ShieldHeld = false
+		intents.ClimbHeld = false
+		intents.ClimbDrop = false
+		intents.Heal = false
+		return
+	}
+
+	// Get hitbox component for attack system
+	hitbox := ecs.GetComponent[components.Hitbox](world, eid)
+
+	// Get input component
+	input := ecs.GetComponent[components.Input](world, eid)
+	if input == nil {
+		return // Cannot process input without Input component
+	}
+
+	// Get physics for climb detection
+	physics := ecs.GetComponent[components.Physics](world, eid)
+
+	bufferedActions(world, eid, player, intents, facing, anim, hitbox, input)
+	applyGuard(intents, input)
+	applyClimb(world, eid, player, intents, anim, dt, input, cfg)
+	processClimbIntents(world, eid, intents, physics, anim, transform) // Pure ECS climb
+	applyHorizontalMovement(world, eid, player, anim, dt, input, cfg)  // Pure ECS
+	applyJump(world, eid, player, intents, anim, stamina, input)
+	applyDebugShortcuts(healing, cfg)
+}
+
+func canProcessInput(anim *components.Animation) bool {
+	return anim.State != components.ConsumeTag
+}
+
+func bufferedActions(world *ecs.World, eid entities.EntityId, player *components.Player, intents *components.ActionIntents, facing *components.Facing, anim *components.Animation, hitbox *components.Hitbox, input *components.Input) {
+	handleAttack(world, eid, player, anim, hitbox, facing, input)
+	if intents != nil {
+		// Try to consume buffered heal press (Pure ECS: check and clear buffer)
+		if input.Buffer[components.InputKeyHeal] {
+			input.Buffer[components.InputKeyHeal] = false
+			intents.Heal = true
+		}
+	}
+	handleDash(world, eid, player, facing, input)
+}
+
+func handleDash(world *ecs.World, eid entities.EntityId, player *components.Player, facing *components.Facing, input *components.Input) {
+	// Try to consume buffered dash press (Pure ECS: check and clear buffer)
+	if !input.Buffer[components.InputKeyDash] {
+		return
+	}
+	input.Buffer[components.InputKeyDash] = false
+
+	physics := ecs.GetComponent[components.Physics](world, eid)
+	if physics == nil {
+		return
+	}
+
+	maxX := physics.MaxVelocity.X
+	if maxX == 0 {
+		maxX = player.Speed
+	}
+	speed := maxX * 4
+	if speed == 0 {
+		speed = player.Speed
+	}
+	if (!facing.FlipX && !input.KeyDown[components.InputKeyRight]) || input.KeyDown[components.InputKeyLeft] {
+		speed *= -1
+	}
+	physics.Velocity.X = speed
+}
+
+func applyGuard(intents *components.ActionIntents, input *components.Input) {
+	if intents == nil {
+		return
+	}
+	intents.ShieldHeld = input.KeyDown[components.InputKeyGuard]
+	if input.KeyReleased[components.InputKeyGuard] {
+		intents.ShieldRelease = true
+	}
+}
+
+func applyDebugShortcuts(healing *components.Healing, cfg *config.Config) {
+	if !cfg.Debug {
+		return
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyTab) {
+		healing.Count = healing.MaxCount
+	}
 }

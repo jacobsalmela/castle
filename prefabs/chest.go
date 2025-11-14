@@ -1,100 +1,133 @@
-package entity
+package prefabs
 
 import (
-	"game/assets"
-	"game/comps/hitbox"
-	"game/comps/render"
-	"game/core"
-	"game/libs/bump"
-	"game/vars"
-	"image"
-	"strconv"
-	"time"
+	"log"
 
-	"github.com/hajimehoshi/ebiten/v2"
-	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"game/assets"
+	"game/components"
+	"game/ecs"
+	"game/entities"
+	"game/pkg/tilemap"
 )
 
 const (
-	chestW, chestH       = 14, 9
-	chestOpenRewardDelay = 500 * time.Millisecond
+	// Visual properties
+	ChestSpriteW = 14 // Sprite width in pixels (exported for system use)
+	ChestSpriteH = 9  // Sprite height in pixels (exported for system use)
+
+	// Collision properties
+	chestHitboxW = 14 // Hitbox width (same as sprite)
+	chestHitboxH = 9  // Hitbox height (same as sprite)
+
+	// Render settings
+	chestRenderLayer = -1 // Render layer (below player)
+
+	// Animation timing (exported for system use)
+	ChestSemiOpenDelay = 0.5 // Seconds before transitioning to semi-open
+	ChestFullOpenDelay = 1.0 // Seconds before transitioning to fully open
+
+	// Gameplay constants
+	chestDefaultReward = 100 // Default number of flake particles spawned
 )
 
-var (
-	chestImage, _, _                                    = ebitenutil.NewImageFromFileSystem(assets.FS, "chest.png")
-	chestCloseImage, chestSemiOpenImage, chestOpenImage *ebiten.Image
-)
-
-func init() {
-	imgSize := chestImage.Bounds().Size()
-	chestCloseImage = chestImage.SubImage(image.Rect(0, imgSize.Y-chestH, imgSize.X, imgSize.Y)).(*ebiten.Image)
-	chestSemiOpenImage = chestImage.SubImage(image.Rect(0, chestH, imgSize.X, 2*chestH+2)).(*ebiten.Image)
-	chestOpenImage = chestImage.SubImage(image.Rect(0, 0, imgSize.X, chestH)).(*ebiten.Image)
-}
-
-type Chest struct {
-	*core.BaseEntity
-	render *render.Comp
-	hitbox *hitbox.Comp
-	reward int
-	open   bool
-}
-
-func NewChest(x, y, _, _ float64, props *core.Properties) *Chest {
-	imageOffset := 0.0
-	if props.FlipX {
-		imageOffset = chestW - tileSize*2
-		x -= chestW - tileSize
+// NewChestPrefab constructs a chest entity.
+func NewChestPrefab(world *ecs.World, x, y, w, h float64, p *tilemap.Properties) entities.EntityId {
+	if world == nil {
+		return 0
 	}
-	reward := 100
-	if customReward, err := strconv.Atoi(props.Custom["reward"]); err == nil {
-		reward = customReward
+
+	// Extract flip flag from properties (if provided)
+	flipX := false
+	imageOffsetX := 0.0
+	if p != nil && p.FlipX {
+		flipX = true
+		// Adjust position and offset for flipped sprite
+		imageOffsetX = ChestSpriteW - TileSize*2
+		x -= ChestSpriteW - TileSize
 	}
-	chest := &Chest{
-		BaseEntity: &core.BaseEntity{X: x, Y: y, W: chestW, H: chestH},
-		render:     &render.Comp{X: imageOffset, Image: chestCloseImage, FlipX: props.FlipX, Layer: -1},
-		hitbox:     &hitbox.Comp{},
-		reward:     reward,
-		open:       props.Custom["open"] == "true",
+
+	// Create entity
+	entityID := world.NewEntity()
+
+	// === SPATIAL COMPONENT ===
+	// Position and dimensions
+	transform := &components.Transform{
+		X: x,
+		Y: y,
+		W: ChestSpriteW,
+		H: ChestSpriteH,
 	}
-	chest.Add(chest.render, chest.hitbox)
+	world.AddComponent(entityID, transform)
 
-	return chest
-}
-
-func (c *Chest) Init() {
-	c.hitbox.HitFunc = c.chestHurt
-	c.hitbox.PushHitbox(bump.Rect{W: chestW, H: chestH}, hitbox.Hit, nil)
-	if c.open {
-		c.Open()
+	// === VISUAL COMPONENT ===
+	// Render with chest sprite (Animation will update the frame)
+	render := &components.Render{
+		X:     imageOffsetX,
+		Image: assets.GetSpriteImage("chest"),
+		FlipX: flipX,
+		Layer: chestRenderLayer,
 	}
-}
+	world.AddComponent(entityID, render)
 
-func (c *Chest) Update(_ float64) {}
-
-func (c *Chest) Opened() bool { return c.open }
-
-func (c *Chest) Open() {
-	c.open = true
-	c.hitbox.Remove()
-	c.render.Image = chestSemiOpenImage
-	c.render.Y = chestH - float64(chestSemiOpenImage.Bounds().Dy())
-}
-
-func (c *Chest) OpenWithReward() {
-	c.Open()
-	time.AfterFunc(chestOpenRewardDelay, func() {
-		c.render.Image = chestOpenImage
-		c.render.Y = 0
-		for range c.reward {
-			vars.World.Add(NewFlake(c))
-		}
-	})
-}
-
-func (c *Chest) chestHurt(other core.Entity, _ *bump.Collision, _ float64, _ hitbox.ContactType) {
-	if c.open || !core.GetFlag(other, vars.PlayerTeamFlag) {
-		return
+	// === ANIMATION COMPONENT ===
+	// Chest uses Aseprite animation with three states:
+	//   - "idle": Closed chest (frame 0, initial state)
+	//   - "activate": Opening animation (frames 1-2)
+	//   - "open": Fully open chest (frame 2, stays here)
+	anim := &components.Animation{
+		FilesName:  "chest",
+		State:      "idle", // Start in idle state (closed chest)
+		FSMInitial: "idle",
+		FSMTransitions: map[string]string{
+			"activate": "open", // After opening animation, transition to open state
+			"open":     "open", // Stay in open state (prevents returning to idle)
+		},
+		OX: 0, OY: 0, // No offsets needed for chest
+		OXFlip: 0, OYFlip: 0,
+		Layer: chestRenderLayer,
 	}
-	c.OpenWithReward()
+	if err := InitializeAnimation(anim); err != nil {
+		// Fallback: chest will still render but without animation
+		// This allows the game to run even if chest.json is missing
+		log.Printf("Warning: Failed to initialize chest animation: %v", err)
+	} else {
+		world.AddComponent(entityID, anim)
+	}
+
+	// === NEW COLLIDER COMPONENT (Phase 2) ===
+	// Ghost collider - chests don't block movement, just need hitbox detection
+	collider := &components.Collider{
+		Tags:      []string{},
+		QueryTags: []string{},
+		Solid:     false, // Ghost collider doesn't block movement
+		Immovable: false,
+		OffsetX:   0,
+		OffsetY:   0,
+		Width:     0, // Use Transform size
+		Height:    0, // Use Transform size
+		FilterOut: []entities.EntityId{},
+	}
+	world.AddComponent(entityID, collider)
+
+	// === COMBAT COMPONENT ===
+	// Hitbox for player attack detection
+	hitbox := NewHitbox(0, 0, chestHitboxW, chestHitboxH) // Offset-based hitbox (relative to transform)
+	world.AddComponent(entityID, hitbox)
+
+	// === BEHAVIOR COMPONENT ===
+	// Chest state and reward configuration
+	chest := &components.Chest{
+		Opened:         false,
+		Reward:         chestDefaultReward,
+		AnimationStage: 0, // 0=closed
+		AnimationTimer: 0.0,
+	}
+	world.AddComponent(entityID, chest)
+
+	// === TEAM COMPONENT ===
+	// Mark as neutral (can be interacted with by any team)
+	team := &components.Team{Type: components.TeamNeutral}
+	world.AddComponent(entityID, team)
+
+	return entityID
 }

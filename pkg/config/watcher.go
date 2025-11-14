@@ -1,90 +1,67 @@
-//nolint:revive, mnd
-package vars
+package config
 
 import (
-	"game/core"
-	"game/utils"
+	"log"
+	"os"
+
+	"github.com/fsnotify/fsnotify"
 )
 
-const (
-	// Config.
-	Scale                     = 4
-	ScreenWidth, ScreenHeight = 160, 96 // 320, 240.
-	Debug                     = debug
+func WatchConfig(cfgPath string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("Failed to create config watcher: %v (config hot-reload disabled)", err)
+		return
+	}
+	defer watcher.Close()
 
-	// Pipeline Layers and Tags.
-	PipelineUILayer      = 10
-	PipelineScreenTag    = "screen"
-	PipelineNormalMapTag = "normal"
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&fsnotify.Write != 0 && event.Name == cfgPath {
+					// Use merge to handle new/deprecated fields
+					cfg, mergeResult, err := LoadConfigWithMerge(cfgPath)
+					if err != nil {
+						log.Println("config reload error:", err)
+						continue
+					}
+					Cfg = cfg
 
-	// Entity Flags.
-	PlayerTeamFlag = iota
-	EnemyTeamFlag
+					// Log merge information
+					if mergeResult != nil {
+						if len(mergeResult.NewFields) > 0 {
+							log.Printf("Added %d new config fields with defaults", len(mergeResult.NewFields))
+						}
+						if len(mergeResult.DeprecatedFields) > 0 {
+							log.Printf("Warning: %d deprecated fields found (will be ignored)", len(mergeResult.DeprecatedFields))
+						}
+					}
 
-	// Anim.
-	IdleTag       = "Idle"
-	WalkTag       = "Walk"
-	AttackTag     = "Attack"
-	BlockTag      = "Block"
-	ParryBlockTag = "ParryBlock"
-	StaggerTag    = "Stagger"
-	ClimbTag      = "Climb"
-	ConsumeTag    = "Consume"
+					// Note: Window size is NOT changed on hot-reload - user controls window size
+					log.Println("(Hot) reloaded config:", cfgPath)
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Println("watcher error:", err)
+			}
+		}
+	}()
 
-	HurtboxSliceName = "hurtbox"
-	HitboxSliceName  = "hitbox"
-	BlockSliceName   = "blockbox"
-	HealSliceName    = "healbox"
+	// Check if file exists before trying to watch it
+	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		log.Printf("File %s does not exist yet, skipping watch", cfgPath)
+		return
+	}
 
-	// Actor.
-	DefaultAttackPushForce                    = 100
-	DefaultReactForce                         = 50
-	DefaultMaxXDiv, DefaultMaxXRecoverRateDiv = 2, 3
-
-	// Stats.
-	DefaultHealth         = 100
-	DefaultStamina        = 80
-	DefaultPoise          = 30
-	DefaultHeal           = 2
-	DefaultHealAmount     = 20
-	AttackMultPerHeal     = 0.2
-	DefaultRecoverRate    = 26
-	DefaultRecoverSeconds = 3
-	HeadHealthShowSeconds = 60
-
-	// HUD consts.
-	HudIconsX                = 7
-	BarEndX1, BarEndX2, BarH = 8, 12, 7
-	BarMiddleH               = BarH - 2
-	MiddleBarX1, MiddleBarX2 = 7, 8
-	InnerBarH                = 3
-	EnemyBarW                = 10
-	MaxTextWidth             = 50
-
-	// Textbox.
-	BoxX, DefaultBoxY            = 6.0, 30.0
-	BoxMarginY, BoxMinY, BoxMaxY = 5, 25, 96 - BoxH - BoxMarginY
-	BoxW, BoxH                   = ScreenWidth - BoxX*2, 3.0
-	LineWidth, LineHeight        = (BoxW - 8), 6 + 1
-	MaxLines                     = 4
-)
-
-var (
-	// Global.
-	World  *core.World
-	Player core.Entity
-
-	// Signaling.
-	SaveGame, ResetGame bool
-
-	// Player.
-	Pad utils.ControlPack
-
-	// Body.
-	Gravity                     = 300.0
-	DefaultMaxX, DefaultMaxY    = 20.0, 200.0
-	GroundFriction, AirFriction = 8.0, 2.0 // TODO: Tune this variables. They might be too high.
-	CollisionStiffness          = 1.0
-	FrictionEpsilon             = 0.05
-	CoyoteTimeSeconds           = 0.1
-)
+	if err := watcher.Add(cfgPath); err != nil {
+		log.Printf("Failed to watch config file %s: %v (config hot-reload disabled)", cfgPath, err)
+		return
+	}
+	select {} // block forever
+}

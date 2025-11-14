@@ -1,80 +1,110 @@
-package entity
+package prefabs
 
 import (
-	"game/comps/ai"
-	"game/comps/anim"
-	"game/comps/body"
-	"game/comps/hitbox"
-	"game/comps/stats"
-	"game/core"
-	"game/entity/actor"
-	"game/libs/bump"
+	"game/components"
+	"game/ecs"
+	"game/entities"
 )
 
 const (
-	entAnimFile                           = "ent"
-	entWidth, entHeight                   = 12, 16
-	entOffsetX, entOffsetY, entOffsetFlip = -8, -4, 17
-	entSpeed, entMaxSpeed                 = 80, 30
-	entHealth                             = 100
-	entDamage, entPoise                   = 40, 41
-	entExp                                = 40
+	// Visual properties
+	entAnimFile   = "ent"
+	entWidth      = 12
+	entHeight     = 16
+	entOffsetX    = -8
+	entOffsetY    = -4
+	entOffsetFlip = 17
+
+	// Physics
+	entMaxSpeed = 30
+
+	// Combat stats
+	entHealth = 100
+	entPoise  = 41
+	entExp    = 40
+
+	// Visual effect durations
+	entFlashDuration = 0.8 // Flash effect duration in seconds
+	entDieDuration   = 1.0 // Death fade duration in seconds
 )
 
-type Ent struct {
-	*core.BaseEntity
-	*actor.Control
-	anim   *anim.Comp
-	body   *body.Comp
-	hitbox *hitbox.Comp
-	stats  *stats.Comp
-	ai     *ai.Comp
-}
+// NewEntPrefab constructs an Ent entity using the shared enemy factory.
+//
+// Ent is a melee enemy with simple AI:
+//  1. Idle: Patrols optional view area, detects player
+//  2. Approach: Moves toward player until in attack range
+//  3. Attack: Swings weapon with cooldown between attacks
+//  4. BackUp: Occasionally retreats to maintain spacing
+//
+// Parameters:
+//   - world: ECS world instance (required)
+//   - x, y: Spawn position in world coordinates
+//   - w, h: Unused (kept for API compatibility)
+//   - flipX: Initial sprite orientation (true = facing right)
+//
+// Returns: EntityId of the created entity, or 0 if world is nil
+func NewEntPrefab(world *ecs.World, x, y, w, h float64, flipX bool) entities.EntityId {
+	config := EnemyConfig{
+		// Animation
+		AnimFile:   entAnimFile,
+		OffsetX:    entOffsetX,
+		OffsetY:    entOffsetY,
+		OffsetFlip: entOffsetFlip,
 
-func NewEnt(x, y, _, _ float64, props *core.Properties) *Ent {
-	ent := &Ent{
-		BaseEntity: &core.BaseEntity{X: x, Y: y, W: entWidth, H: entHeight},
-		anim:       &anim.Comp{FilesName: entAnimFile, OX: entOffsetX, OY: entOffsetY, OXFlip: entOffsetFlip, FlipX: props.FlipX},
-		body:       &body.Comp{MaxX: entMaxSpeed},
-		hitbox:     &hitbox.Comp{},
-		stats:      &stats.Comp{MaxHealth: entHealth, MaxPoise: entPoise, Exp: entExp},
-		ai:         &ai.Comp{},
+		// Animation behavior
+		AnimLayer:      5,
+		AnimFSMInitial: "Idle",
+		AnimFSMTransitions: map[string]string{
+			"Attack": "Idle",
+		},
+
+		// Dimensions
+		Width:  entWidth,
+		Height: entHeight,
+
+		// Physics
+		Weight:          0, // Default weight
+		GravityEnabled:  true,
+		FrictionEnabled: true,
+
+		// Stats
+		Health: entHealth,
+		Poise:  entPoise,
+		Exp:    entExp,
+
+		// Visual effects
+		FlashDuration: entFlashDuration,
+		FlashColor:    [3]float32{1, 1, 1}, // White
+		DieDuration:   entDieDuration,
+
+		// Detection (360° vision, 1.5x entity size in all directions)
+		DetectionFront: 18.0, // 1.5 * entWidth
+		DetectionBack:  18.0,
+		DetectionUp:    24.0, // 1.5 * entHeight
+		DetectionDown:  24.0,
+
+		// Optional behavior components
+		ApproachBehavior: &components.ApproachBehavior{
+			Speed:           65.0,
+			MaxSpeed:        30.0, // Slow ent
+			MinRange:        20.0,
+			RangeAdjustment: 0.0,
+		},
+		BackupBehavior: &components.BackupBehavior{
+			Speed:    65.0,
+			MaxRange: 24.0,
+		},
+		MeleeAttackBehavior: &components.MeleeAttackBehavior{
+			Damage:       40.0,
+			PushForce:    10.0,
+			ReactForce:   12.0,
+			AnimationTag: "Attack",
+		},
 	}
-	ent.Add(ent.anim, ent.body, ent.hitbox, ent.stats, ent.ai)
-	ent.Control = actor.NewControl(ent)
 
-	var view *bump.Rect
-	if props.View != nil {
-		viewRect := bump.NewRect(props.View.X, props.View.Y, props.View.Width, props.View.Height)
-		view = &viewRect
-	}
-	ent.ai.SetAct(func() { ent.aiScript(view) })
-
-	return ent
-}
-
-func (g *Ent) Comps() (anim *anim.Comp, body *body.Comp, hitbox *hitbox.Comp, stats *stats.Comp, ai *ai.Comp) {
-	return g.anim, g.body, g.hitbox, g.stats, g.ai
-}
-
-func (g *Ent) Update(dt float64) { g.SimpleUpdate(dt) }
-
-//nolint:mnd
-func (g *Ent) aiScript(view *bump.Rect) {
-	g.ai.Add(0, actor.IdleAction(g.Control, view))
-	ai.Choices{
-		{0.2, func() {
-			g.ai.Add(0, actor.ApproachAction(g.Control, entSpeed, entMaxSpeed, 10))
-			g.ai.Add(0.2, actor.WaitAction())
-		}},
-		{1, func() {
-			g.ai.Add(0, actor.ApproachAction(g.Control, entSpeed, entMaxSpeed, 0))
-			g.ai.Add(0.1, actor.WaitAction())
-			ai.Choices{
-				{2, func() { g.ai.Add(5, actor.AttackAction(g.Control, "Attack", entDamage)) }},
-				{0.5, func() { g.ai.Add(1, actor.BackUpAction(g.Control, entSpeed, 0)) }},
-				{1, func() { g.ai.Add(0.1, actor.WaitAction()) }},
-			}.Play()
-		}},
-	}.Play()
+	// Create enemy with Ent-specific component
+	return NewEnemyPrefab(world, x, y, flipX, config, &components.Ent{
+		Paused:         false,
+		AttackCooldown: 0,
+	})
 }

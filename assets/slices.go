@@ -1,222 +1,369 @@
-package anim
+package assets
 
 import (
+	"embed"
+	"encoding/json"
 	"fmt"
-	"game/assets"
-	"game/core"
-	"game/libs/bump"
-	"game/utils"
-	"game/vars"
-	"image/color"
 	"log"
-	"math"
-	"slices"
+	"strings"
 
-	"github.com/damienfamed75/aseprite"
-	"github.com/hajimehoshi/ebiten/v2"
-	"github.com/hajimehoshi/ebiten/v2/colorm"
-	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"game/pkg/bump"
 )
 
-var DebugDraw = false
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASEPRITE SLICE DATA STRUCTURES
+// ═══════════════════════════════════════════════════════════════════════════════
 
-type Fsm struct {
-	Initial     string
-	Transitions map[string]string
+// AsepriteSliceData represents the complete slice export from an Aseprite file.
+// This matches the structure of the "slices" array in the JSON export.
+type AsepriteSliceData struct {
+	Name  string             `json:"name"`  // Slice name (e.g., "hurtbox", "hitbox", "blockbox")
+	Color string             `json:"color"` // Color hex (e.g., "#fe5b59ff")
+	Keys  []AsepriteSliceKey `json:"keys"`  // Frame-specific bounds
 }
 
-type SliceCallback func(slice bump.Rect, segmented bool)
-
-type stateEffect struct {
-	restore func()
-	states  []string
+// AsepriteSliceKey represents a single frame's slice bounds.
+type AsepriteSliceKey struct {
+	Frame  int                 `json:"frame"`  // Frame number (0-indexed)
+	Bounds AsepriteSliceBounds `json:"bounds"` // Rectangle bounds
+	Pivot  *AsepriteSlicePivot `json:"pivot"`  // Optional pivot point (for rotation)
 }
 
-type Comp struct {
-	FilesName      string
-	OX, OY         float64
-	OXFlip, OYFlip float64
-	FlipX, FlipY   bool
-	Layer          int
-	ColorScale     color.Color
-	Fsm            *Fsm
-
-	State          string
-	Image          *ebiten.Image
-	Data           *aseprite.File
-	w, h           float64
-	slices         map[string]map[int]bump.Rect
-	stateEffect    *stateEffect
-	sliceCallback  func()
-	frameCallbacks map[int]func()
+// AsepriteSliceBounds represents the rectangle bounds of a slice.
+type AsepriteSliceBounds struct {
+	X int `json:"x"` // X position (sprite-relative)
+	Y int `json:"y"` // Y position (sprite-relative)
+	W int `json:"w"` // Width
+	H int `json:"h"` // Height
 }
 
-func (c *Comp) Init(_ core.Entity) {
-	var err error
-	if c.Image, _, err = ebitenutil.NewImageFromFileSystem(assets.FS, c.FilesName+".png"); err != nil {
-		log.Panic(err)
+// AsepriteSlicePivot represents an optional pivot point (currently unused).
+type AsepriteSlicePivot struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
+// AsepriteJSON represents the root structure of an Aseprite JSON export.
+// We only parse the "slices" field for hitbox data.
+type AsepriteJSON struct {
+	Meta AsepriteMetaData `json:"meta"`
+}
+
+// AsepriteMetaData contains metadata including slice definitions.
+type AsepriteMetaData struct {
+	Slices []AsepriteSliceData `json:"slices"`
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLICE PARSING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// LoadAllSlices parses all Aseprite JSON files in the assets directory.
+// This should be called during InitSync() before entities are created.
+//
+// Parsing strategy:
+//  1. Find all .json files in the embedded FS (organized by subdirectories)
+//  2. Parse each file's "slices" field
+//  3. Convert slice bounds to bump.Rect format
+//  4. Store in SliceRegistry by file name (without path/extension)
+func LoadAllSlices(fs embed.FS) error {
+	// Animation file paths organized by category
+	// Each entry: [base name, relative path to JSON]
+	animFiles := map[string]string{
+		// Enemies (in images/enemies/)
+		"bat":      "images/enemies/bat.json",
+		"rat":      "images/enemies/rat.json",
+		"crawler":  "images/enemies/crawler.json",
+		"ent":      "images/enemies/ent.json",
+		"ghoul":    "images/enemies/ghoul.json",
+		"skeleman": "images/enemies/skeleman.json",
+
+		// NPCs (in images/npcs/)
+		"ferragus": "images/npcs/ferragus.json",
+		"gram":     "images/npcs/gram.json",
+		"oscar":    "images/npcs/oscar.json",
+
+		// Player (in images/player/)
+		"knight": "images/player/knight.json",
 	}
-	animData, err := assets.FS.ReadFile(c.FilesName + ".json")
+
+	loaded := 0
+	for baseName, jsonPath := range animFiles {
+		if err := parseSliceFile(fs, baseName, jsonPath); err != nil {
+			// Non-critical: some files may not have JSON exports
+			log.Printf("  ⚠ Slice parsing skipped for %s (%s): %v", baseName, jsonPath, err)
+			continue
+		}
+		loaded++
+	}
+
+	if loaded > 0 {
+		log.Printf("  ✓ Loaded slice data from %d animation files", loaded)
+
+		// Validate knight slices (player sprite - critical)
+		validateKnightSlices()
+	} else {
+		log.Println("  ⚠ No slice data found in animation files")
+	}
+
+	return nil
+}
+
+// validateKnightSlices validates that the knight (player) sprite has valid slice data.
+// This is critical for debugging sprite rendering issues.
+func validateKnightSlices() {
+	asset, ok := AssetRegistry["knight"]
+	if !ok || asset.Slices == nil {
+		log.Println("  ⚠ WARNING: knight has NO slice data!")
+		return
+	}
+
+	log.Println("  → Knight slice validation:")
+	for sliceName, frameMap := range asset.Slices {
+		log.Printf("    • %s: %d frames", sliceName, len(frameMap))
+
+		// Show first few frames as examples
+		frameCount := 0
+		for frame, rect := range frameMap {
+			if frameCount < 3 {
+				log.Printf("      - Frame %d: x=%.0f y=%.0f w=%.0f h=%.0f",
+					frame, rect.X, rect.Y, rect.W, rect.H)
+			}
+			frameCount++
+		}
+	}
+}
+
+// parseSliceFile parses a single Aseprite JSON file and stores its slices.
+func parseSliceFile(fs embed.FS, baseName, jsonPath string) error {
+	// Read JSON file from embedded FS
+	data, err := fs.ReadFile(jsonPath)
 	if err != nil {
-		log.Panic(err)
-	}
-	if c.Data, err = aseprite.NewFile(animData); err != nil {
-		log.Panic(err)
-	}
-	if c.Fsm == nil {
-		c.Fsm = DefaultFsm()
+		return fmt.Errorf("failed to read file: %w", err)
 	}
 
-	if c.ColorScale == nil {
-		c.ColorScale = color.White
-	}
-	c.State = ""
-	c.SetState(c.Data.Meta.Animations[0].Name)
-	c.frameCallbacks = map[int]func(){}
-	rect := c.Data.Frames.FrameAtIndex(c.Data.CurrentFrame).SpriteSourceSize
-	c.w, c.h = float64(rect.Width), float64(rect.Height)
-
-	c.allocateSlices()
-}
-
-func (c *Comp) Remove() {}
-
-func (c *Comp) SetState(state string) {
-	if c.State == state {
-		return
-	}
-	c.State = state
-	if err := c.Data.Play(state); err != nil {
-		log.Printf("anim: %s", err)
-
-		return
-	}
-	if c.stateEffect != nil && !slices.Contains(c.stateEffect.states, c.State) {
-		c.stateEffect.restore()
-		c.stateEffect = nil
-	}
-	c.sliceCallback = nil
-	c.frameCallbacks = map[int]func(){}
-}
-
-func (c *Comp) Update(dt float64) {
-	c.Data.Update(float32(dt))
-	if c.Data.AnimationFinished() {
-		nextState, ok := c.Fsm.Transitions[c.State]
-		if !ok {
-			nextState = c.Fsm.Initial
-		}
-		if nextState != "" {
-			c.SetState(nextState)
-		}
-	}
-	currentAnimFrame := c.Data.CurrentFrame - c.Data.CurrentAnimation.From
-	if frameCallback := c.frameCallbacks[currentAnimFrame]; frameCallback != nil {
-		frameCallback()
-		delete(c.frameCallbacks, currentAnimFrame)
-	}
-	if c.sliceCallback != nil {
-		c.sliceCallback()
-	}
-}
-
-func (c *Comp) Draw(pipeline *core.Pipeline, entityPos ebiten.GeoM) {
-	op := &ebiten.DrawImageOptions{}
-	var x, y, sx, sy, dx, dy float64 = c.OX, c.OY, 1, 1, 0, 0
-	if c.FlipX {
-		sx, dx = -1, math.Floor(c.w/2)+c.OXFlip
-	}
-	if c.FlipY {
-		sy, dy = -1, math.Floor(c.h/2)+c.OYFlip
-	}
-	op.GeoM.Scale(sx, sy)
-	op.GeoM.Translate(x+dx, y+dy)
-	op.GeoM.Concat(entityPos)
-	op.ColorScale.ScaleWithColor(c.ColorScale)
-	sprite, _ := c.Image.SubImage(c.Data.FrameBoundaries().Rectangle()).(*ebiten.Image)
-	pipeline.Add(vars.PipelineScreenTag, c.Layer, func(screen *ebiten.Image) { screen.DrawImage(sprite, op) })
-	normalOp := &colorm.DrawImageOptions{GeoM: op.GeoM}
-	pipeline.Add(vars.PipelineNormalMapTag, c.Layer, func(normalMap *ebiten.Image) {
-		colorm.DrawImage(normalMap, sprite, FillNormalMaskColorM, normalOp)
-	})
-	if DebugDraw {
-		pipeline.Add(vars.PipelineScreenTag, vars.PipelineUILayer, func(screen *ebiten.Image) { c.debugDraw(screen, entityPos) })
-	}
-}
-
-func (c *Comp) OnSlicePresent(sliceName string, callback SliceCallback) {
-	if callback == nil {
-		c.sliceCallback = nil
-
-		return
-	}
-	newSlice := true
-	c.sliceCallback = func() {
-		slice, err := c.FrameSlice(sliceName)
-		if err != nil {
-			newSlice = true
-
-			return
-		}
-		callback(slice, newSlice)
-		newSlice = false
-	}
-}
-
-func (c *Comp) OnFrame(frame int, callback func()) { c.frameCallbacks[frame] = callback }
-
-func (c *Comp) FrameSlice(sliceName string) (bump.Rect, error) {
-	keys := c.slices[sliceName]
-	if keys == nil {
-		return bump.Rect{}, fmt.Errorf("slice name %s not found", sliceName)
-	}
-	rect, ok := keys[c.Data.CurrentFrame]
-	if !ok {
-		return bump.Rect{}, fmt.Errorf("no slice in current frame %d", c.Data.CurrentFrame)
+	// Parse JSON structure
+	var aseJSON AsepriteJSON
+	if err := json.Unmarshal(data, &aseJSON); err != nil {
+		return fmt.Errorf("failed to parse JSON: %w", err)
 	}
 
-	frame := c.Data.Frames.FrameAtIndex(c.Data.CurrentFrame)
-	ssx, ssy := float64(frame.SpriteSourceSize.X), float64(frame.SpriteSourceSize.Y)
-	sw, sh := float64(frame.SourceSize.Width), float64(frame.SourceSize.Height)
-
-	if c.FlipX {
-		rect.X += sw - rect.W - (rect.X+ssx)*2
+	// Check if slices exist
+	if len(aseJSON.Meta.Slices) == 0 {
+		return fmt.Errorf("no slices defined")
 	}
-	if c.FlipY {
-		rect.Y += sh - rect.W - (rect.Y+ssy)*2
-	}
-	rect.X += c.OX
-	rect.Y += c.OY
 
-	return rect, nil
-}
+	// Convert to SliceMap structure
+	sliceMap := make(map[string]map[int]bump.Rect)
+	totalSlices := 0
 
-func (c *Comp) SetStateEffect(applyAndGetRestore func() func(), forStates ...string) {
-	if c.stateEffect != nil {
-		c.stateEffect.restore()
-	}
-	c.stateEffect = &stateEffect{applyAndGetRestore(), forStates}
-}
+	for _, slice := range aseJSON.Meta.Slices {
+		sliceName := slice.Name
+		frameMap := make(map[int]bump.Rect)
 
-func (c *Comp) allocateSlices() {
-	c.slices = map[string]map[int]bump.Rect{}
-
-	for _, slice := range c.Data.Meta.Slices {
-		c.slices[slice.Name] = map[int]bump.Rect{}
 		for _, key := range slice.Keys {
-			sss := c.Data.Frames.FrameAtIndex(key.FrameNum).SpriteSourceSize
+			frameNum := key.Frame
+			rect := bump.Rect{
+				X: float64(key.Bounds.X),
+				Y: float64(key.Bounds.Y),
+				W: float64(key.Bounds.W),
+				H: float64(key.Bounds.H),
+			}
+			frameMap[frameNum] = rect
+			totalSlices++
+		}
 
-			bound := key.Bounds
-			c.slices[slice.Name][key.FrameNum] = bump.Rect{
-				X: float64(bound.X) - float64(sss.X), Y: float64(bound.Y) - float64(sss.Y),
-				W: float64(bound.Width), H: float64(bound.Height),
+		sliceMap[sliceName] = frameMap
+	}
+
+	// Note: This function is deprecated. Slices are now loaded via sprite_loader.go
+	// which stores them directly in AssetRegistry during LoadAllAssets().
+	// This parseSliceFile is only kept for reference.
+
+	log.Printf("    • %s: %d slices across %d types", baseName, totalSlices, len(sliceMap))
+	return nil
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLICE ACCESS API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// GetSliceMap returns the full slice map for an animation file.
+// Returns nil if no slices exist.
+//
+// Example:
+//
+//	slices := assets.GetSliceMap("knight")
+//	if slices != nil {
+//	    hurtbox := slices["hurtbox"][0] // Frame 0 hurtbox
+//	}
+func GetSliceMap(animFileName string) map[string]map[int]bump.Rect {
+	if asset, ok := AssetRegistry[animFileName]; ok {
+		return asset.Slices
+	}
+	return nil
+}
+
+// GetSlice returns a specific slice rect for a given frame.
+// Returns (rect, true) if found, (zero rect, false) if not found.
+//
+// Example:
+//
+//	if rect, ok := assets.GetSlice("knight", "hurtbox", 0); ok {
+//	    // Use rect for hitbox
+//	}
+func GetSlice(animFileName, sliceName string, frame int) (bump.Rect, bool) {
+	asset, ok := AssetRegistry[animFileName]
+	if !ok || asset.Slices == nil {
+		return bump.Rect{}, false
+	}
+
+	frameMap := asset.Slices[sliceName]
+	if frameMap == nil {
+		return bump.Rect{}, false
+	}
+
+	rect, ok := frameMap[frame]
+	return rect, ok
+}
+
+// HasSlices reports whether an animation file has any slice data.
+func HasSlices(animFileName string) bool {
+	if asset, ok := AssetRegistry[animFileName]; ok {
+		return asset.Slices != nil && len(asset.Slices) > 0
+	}
+	return false
+}
+
+// GetSliceNames returns all slice names defined for an animation file.
+// Useful for debugging or validation.
+//
+// Example:
+//
+//	names := assets.GetSliceNames("knight")
+//	// ["hurtbox", "hitbox", "blockbox"]
+func GetSliceNames(animFileName string) []string {
+	asset, ok := AssetRegistry[animFileName]
+	if !ok || asset.Slices == nil {
+		return nil
+	}
+
+	names := make([]string, 0, len(asset.Slices))
+	for name := range asset.Slices {
+		names = append(names, name)
+	}
+	return names
+}
+
+// GetSliceFrameCount returns the number of frames with slice data.
+// Returns 0 if the slice doesn't exist.
+//
+// Example:
+//
+//	count := assets.GetSliceFrameCount("knight", "hitbox")
+//	// 4 (frames 14, 15, 20, 21 for knight attack)
+func GetSliceFrameCount(animFileName, sliceName string) int {
+	asset, ok := AssetRegistry[animFileName]
+	if !ok || asset.Slices == nil {
+		return 0
+	}
+
+	frameMap := asset.Slices[sliceName]
+	return len(frameMap)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUG UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// PrintSliceRegistry dumps the entire slice registry to the log.
+// Useful for debugging slice loading issues.
+func PrintSliceRegistry() {
+	log.Println("=== Slice Registry (AssetRegistry) ===")
+	for animFile, asset := range AssetRegistry {
+		if asset.Slices == nil || len(asset.Slices) == 0 {
+			continue
+		}
+		log.Printf("  %s:", animFile)
+		for sliceName, frameMap := range asset.Slices {
+			frames := make([]int, 0, len(frameMap))
+			for frame := range frameMap {
+				frames = append(frames, frame)
+			}
+			log.Printf("    • %s: %d frames", sliceName, len(frames))
+		}
+	}
+}
+
+// ValidateSliceRegistry checks for common issues in the slice registry.
+// Returns warnings (non-critical issues) and errors (critical issues).
+func ValidateSliceRegistry() (warnings []string, errors []string) {
+	// Count assets with slice data
+	sliceCount := 0
+	for _, asset := range AssetRegistry {
+		if asset.Slices != nil && len(asset.Slices) > 0 {
+			sliceCount++
+		}
+	}
+
+	if sliceCount == 0 {
+		errors = append(errors, "No assets with slice data loaded")
+		return
+	}
+
+	// Check for missing standard slices
+	standardSlices := []string{"hurtbox", "hitbox"}
+	for animFile, asset := range AssetRegistry {
+		if asset.Slices == nil {
+			continue
+		}
+		// Skip validation for non-combat entities (chests, doors, etc.)
+		if isCombatEntity(animFile) {
+			for _, sliceName := range standardSlices {
+				if _, ok := asset.Slices[sliceName]; !ok {
+					warnings = append(warnings, fmt.Sprintf("%s missing '%s' slice", animFile, sliceName))
+				}
 			}
 		}
 	}
+
+	return warnings, errors
 }
 
-func (c *Comp) debugDraw(screen *ebiten.Image, entityPos ebiten.GeoM) {
-	op := &ebiten.DrawImageOptions{GeoM: entityPos}
-	op.GeoM.Translate(-5, -22)
-	utils.DrawText(screen, "ANIM:"+c.State, assets.NanoFont, op)
+// isCombatEntity reports whether an animation file represents a combat-capable entity.
+// Non-combat entities (chests, doors, projectiles) don't need hurtbox/hitbox slices.
+func isCombatEntity(animFile string) bool {
+	nonCombat := []string{"chest", "door", "rock", "flake", "grave", "smoke", "spike"}
+	for _, nc := range nonCombat {
+		if strings.Contains(strings.ToLower(animFile), nc) {
+			return false
+		}
+	}
+	return true
 }
+
+// GetSliceColor returns the color associated with a slice type.
+// This is metadata from Aseprite and can be used for debug rendering.
+//
+// Note: Colors are stored in the JSON but not currently parsed.
+// Future enhancement: Parse slice.Color field from JSON and store in registry.
+func GetSliceColor(animFileName, sliceName string) string {
+	// Return standard colors based on slice name (matches Aseprite defaults)
+	switch sliceName {
+	case "hurtbox":
+		return "#fe5b59ff" // Red
+	case "hitbox":
+		return "#6acd5bff" // Green
+	case "blockbox", "block":
+		return "#0000ffff" // Blue
+	case "healbox":
+		return "#ffff00ff" // Yellow
+	default:
+		return "#ffffffff" // White
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIGRATION HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+

@@ -1,145 +1,47 @@
-package entity
+package prefabs
 
 import (
-	"game/comps/ai"
-	"game/comps/anim"
-	"game/comps/body"
-	"game/comps/hitbox"
-	"game/comps/stats"
-	"game/core"
-	"game/entity/actor"
-	"game/libs/bump"
-	"game/vars"
+	"game/components"
+	"game/ecs"
+	"game/entities"
 )
 
-const (
-	ratWidth, ratHeight                   = 11, 7
-	ratOffsetX, ratOffsetY, ratOffsetFlip = -13, -17, 21
-	ratSpeed, ratMaxSpeed                 = 60.0, 40
-	ratWeight                             = 0.6
-	ratHealth                             = 25
-	ratDamage                             = 15
-	ratExp                                = 15
-	ratPoise                              = 10
-)
+// NewRatPrefab constructs a Rat entity using the shared enemy factory.
+//
+// Rats are small, fast ground enemies with patrol and chase behavior:
+//  1. Idle: Stand still, scan patrol area for targets
+//  2. Patrol: Simple back-and-forth movement
+//  3. Chase: Pursue player when detected
+//  4. Attack: Melee strike at close range
+//
+// Balance values are loaded from config.yml (enemy_balance.rat section).
+//
+// Parameters:
+//   - world: ECS world instance (required)
+//   - x, y: Spawn position in world coordinates
+//   - w, h: Size parameters (unused, dimensions defined by config)
+//   - flipX: Initial facing direction (true = left, false = right)
+//
+// Returns: EntityId of the created entity, or 0 if world is nil
+func NewRatPrefab(world *ecs.World, x, y, w, h float64, flipX bool) entities.EntityId {
+	// Load config from world
+	config := GetEnemyConfig(world, "rat")
 
-type Rat struct {
-	*core.BaseEntity
-	*actor.Control
-	anim      *anim.Comp
-	body      *body.Comp
-	hitbox    *hitbox.Comp
-	stats     *stats.Comp
-	ai        *ai.Comp
-	jumpFrame int
-}
-
-func NewRat(x, y, _, _ float64, props *core.Properties) *Rat {
-	rat := &Rat{
-		BaseEntity: &core.BaseEntity{X: x, Y: y, W: ratWidth, H: ratHeight},
-		anim: &anim.Comp{
-			FilesName: "rat",
-			OX:        ratOffsetX, OY: ratOffsetY,
-			OXFlip: ratOffsetFlip,
-			FlipX:  props.FlipX,
-		},
-		body:   &body.Comp{Weight: ratWeight},
-		hitbox: &hitbox.Comp{},
-		stats:  &stats.Comp{MaxHealth: ratHealth, MaxPoise: ratPoise, Exp: ratExp},
-		ai:     &ai.Comp{},
+	// Animation behavior (not in config - specific to rat)
+	config.AnimLayer = 5
+	config.AnimFSMInitial = "Idle"
+	config.AnimFSMTransitions = map[string]string{
+		"Attack": "Idle",
 	}
-	rat.Add(rat.anim, rat.body, rat.hitbox, rat.stats, rat.ai)
-	rat.Control = actor.NewControl(rat)
 
-	var view *bump.Rect
-	if props.View != nil {
-		viewRect := bump.NewRect(props.View.X, props.View.Y, props.View.Width, props.View.Height)
-		view = &viewRect
-	}
-	rat.ai.SetAct(func() { rat.aiScript(view) })
+	// NOTE: Rat uses behavior tree system (rat_bt.go) instead of behavior components
+	// ApproachBehavior and BackupBehavior are not needed for BT implementation
+	config.ApproachBehavior = nil
+	config.BackupBehavior = nil
 
-	return rat
-}
-
-func (r *Rat) Comps() (anim *anim.Comp, body *body.Comp, hitbox *hitbox.Comp, stats *stats.Comp, ai *ai.Comp) {
-	return r.anim, r.body, r.hitbox, r.stats, r.ai
-}
-
-func (r *Rat) Init() {
-	r.Control.Init()
-	r.jumpFrame = r.anim.Data.Animation("Jump").From - r.anim.Data.Animation("Attack").From
-}
-
-func (r *Rat) Update(dt float64) {
-	r.SimpleUpdate(dt)
-	if !r.body.Ground && (r.anim.State == vars.IdleTag || r.anim.State == vars.WalkTag) {
-		r.anim.SetState("Jump")
-	}
-	if r.body.Ground && r.anim.State == "Jump" {
-		r.anim.SetState(vars.IdleTag)
-	}
-}
-
-func (r *Rat) jumpAttackAction() *ai.Action {
-	speed := ratSpeed
-	jumped, lifted := false, false
-
-	return &ai.Action{
-		Name: "JumpAttack",
-		Entry: func() {
-			if r.PausingState() {
-				return
-			}
-			r.Control.Attack("Attack", ratDamage, ratDamage, 10, 10)
-			r.anim.OnFrame(r.jumpFrame, func() {
-				jumped = true
-				r.body.MaxX = ratMaxSpeed * 2
-				r.body.Vy = -ratSpeed
-				r.body.Ground = false
-				if r.anim.FlipX {
-					r.body.Vx += ratMaxSpeed * 2
-				} else {
-					r.body.Vx -= ratMaxSpeed * 2
-					speed *= -1
-				}
-			})
-		},
-		Next: func(dt float64) bool {
-			if r.anim.State != "Attack" {
-				return true
-			}
-			if !r.body.Ground {
-				lifted = true
-			}
-			if !jumped || !lifted {
-				return false
-			}
-			if !r.PausingState() {
-				r.body.Vx += speed * dt
-			}
-			if r.body.Ground {
-				r.anim.SetState(vars.IdleTag)
-			}
-
-			return false
-		},
-		Exit: func() { r.body.MaxX = ratMaxSpeed },
-	}
-}
-
-//nolint:mnd
-func (r *Rat) aiScript(view *bump.Rect) {
-	rangeAdjustment := 10.0
-	r.ai.Add(0, actor.IdleAction(r.Control, view))
-	r.ai.Add(0, actor.ApproachAction(r.Control, ratSpeed, ratMaxSpeed, rangeAdjustment))
-	r.ai.Add(0.1, actor.WaitAction())
-
-	ai.Choices{
-		{2, func() {
-			r.ai.Add(3, r.jumpAttackAction())
-			r.ai.Add(0.5, actor.WaitAction())
-		}},
-		{0.5, func() { r.ai.Add(1, actor.BackUpAction(r.Control, ratSpeed, -rangeAdjustment)) }},
-		{1, func() { r.ai.Add(0.5, actor.WaitAction()) }},
-	}.Play()
+	// Create enemy with Rat-specific component
+	return NewEnemyPrefab(world, x, y, flipX, config, &components.Rat{
+		Paused: false,
+		// RemovalTarget set automatically by factory
+	})
 }

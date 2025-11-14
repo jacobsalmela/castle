@@ -1,44 +1,54 @@
 package assets
 
 import (
-	"bytes"
 	embed "embed"
+	"game/assets/fonts"
+	"game/assets/maps"
+	"game/pkg/config"
 	"log"
-
-	"github.com/hajimehoshi/ebiten/v2/text/v2"
+	"sync"
 )
 
 var (
 	// FS is the embedded file system for all assets.
-	//go:embed *.png *.json
+	// Embeds all PNG and JSON files in assets/ root and images/ subdirectories
+	//go:embed images/**/*.png images/**/*.json
 	FS embed.FS
 
-	//go:embed m5x7.ttf
-	m5x7File []byte
-	//go:embed m6x11.ttf
-	m6x11File []byte
-	//go:embed nano.ttf
-	nanoFile []byte
+	// Note: Map assets are embedded separately in assets/maps/maps.go
+	// to provide a dedicated namespace for map data
 )
 
-var (
-	M5x7Font  *text.GoTextFace
-	M6x11Font *text.GoTextFace
-	NanoFont  *text.GoTextFace
-)
+var once sync.Once
+var wg sync.WaitGroup
 
-//nolint:mnd
-func init() {
-	M5x7Font = loadFont(m5x7File, 16)
-	M6x11Font = loadFont(m6x11File, 16)
-	NanoFont = loadFont(nanoFile, 6)
-}
+// Init loads all assets synchronously.
+// It is safe to call multiple times.
+//
+// Parameters:
+//   - cfg: Game configuration. If nil, uses default config.
+func Init(cfg *config.Config) {
+	once.Do(func() {
+		if cfg == nil {
+			cfg = config.NewDefaultConfig()
+		}
 
-func loadFont(data []byte, size float64) *text.GoTextFace {
-	face, err := text.NewGoTextFaceSource(bytes.NewReader(data))
-	if err != nil {
-		log.Panic(err)
-	}
+		log.Println("Loading font assets...")
+		fonts.Init()
 
-	return &text.GoTextFace{Source: face, Size: size}
+		// New unified loader (replaces InitImages + LoadAllSlices)
+		if err := LoadAllAssets(FS, cfg.DebugConsole); err != nil {
+			log.Printf("Error loading sprite assets: %v", err)
+		}
+
+		// Load procedural images (HUD bars, etc.)
+		if err := initProceduralAssets(cfg); err != nil {
+			log.Printf("Error loading procedural images: %v", err)
+		}
+
+		maps.Init(cfg.DebugConsole)
+
+		// log.Println("Loading audio assets...")
+		// audio.Init()
+	})
 }

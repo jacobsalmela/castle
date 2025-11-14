@@ -1,211 +1,220 @@
-package entity
+package prefabs
 
 import (
-	"game/comps/ai"
-	"game/comps/anim"
-	"game/comps/body"
-	"game/comps/hitbox"
-	"game/comps/stats"
-	"game/core"
-	"game/entity/actor"
-	"game/libs/bump"
-	"game/utils"
-	"game/vars"
-	"log"
-	"math"
-	"strings"
-	"time"
-
-	"github.com/hajimehoshi/ebiten/v2"
-	"github.com/hajimehoshi/ebiten/v2/inpututil"
+	"game/components"
+	"game/components/spatial"
+	"game/ecs"
+	"game/entities"
+	"game/pkg/config"
+	"game/systems/update/preupdate"
 )
 
 const (
-	tileSize = 8
+	// Visual properties (player uses knight sprite)
+	playerAnimFile = "knight" // Animation file base name
+	playerWidth    = 8        // Collision width in pixels
+	playerHeight   = 11       // Collision height in pixels
 
-	playerMaxX, playerSpeed, playerJumpSpeed, playerClimbSpeed = 55, 350, 110, 5
-	playerDamage, playerPoise                                  = 20, 16
-	jumpingStamina                                             = 30
+	// Sprite offset configuration
+	playerOffsetX    = -10 // Sprite offset when facing right
+	playerOffsetY    = -3  // Vertical sprite offset
+	playerOffsetFlip = 17  // Sprite offset when facing left
 
-	keyBufferDuration = 500 * time.Millisecond
+	// Physics properties
+	playerWeight = 1.0 // Normal weight for knockback calculations
+
+	// Player stats (different from enemies - player is stronger)
+	playerMaxHealth  = 60 // Hit points
+	playerMaxStamina = 65 // Action resource (attacks, dodges, jumps)
+	playerMaxHeal    = 5  // Healing charges (limited resource)
+
+	playerDefaultMaxX       = 55
+	playerDefaultSpeed      = 350
+	playerDefaultJumpSpeed  = 110
+	playerDefaultClimbSpeed = 5
+	playerDefaultDamage     = 20
+	playerDefaultPoise      = 16
+	playerDefaultJumpCost   = 30
 )
 
-type Player struct {
-	*core.BaseEntity
-	*actor.Control
-	anim   *anim.Comp
-	body   *body.Comp
-	hitbox *hitbox.Comp
-	stats  *stats.Comp
-
-	speed, jumpSpeed            float64
-	reactForce, attackPushForce float64
-	attackLevel                 float64
-}
-
-func NewPlayer(x, y float64) *Player {
-	p := &Player{
-		BaseEntity: &core.BaseEntity{X: x, Y: y, W: knightWidth, H: knightHeight},
-		anim:       &anim.Comp{FilesName: knightAnimFile, OX: knightOffsetX, OY: knightOffsetY, OXFlip: knightOffsetFlip},
-		body:       &body.Comp{MaxX: playerMaxX},
-		hitbox:     &hitbox.Comp{},
-		stats:      &stats.Comp{Hud: true, NoDebug: true, MaxHealth: 60, MaxStamina: 65, MaxPoise: playerPoise, MaxHeal: 5},
-
-		attackPushForce: vars.DefaultAttackPushForce,
-		reactForce:      vars.DefaultReactForce,
-		speed:           playerSpeed, jumpSpeed: playerJumpSpeed,
-	}
-	p.Add(p.anim, p.body, p.hitbox, p.stats)
-	p.Control = actor.NewControl(p)
-	core.SetFlag(p, vars.PlayerTeamFlag, true)
-
-	return p
-}
-
-func (p *Player) Comps() (anim *anim.Comp, body *body.Comp, hitbox *hitbox.Comp, stats *stats.Comp, ai *ai.Comp) {
-	return p.anim, p.body, p.hitbox, p.stats, nil
-}
-
-func (p *Player) Init() {
-	hurtbox, err := p.anim.FrameSlice(vars.HurtboxSliceName)
-	if err != nil {
-		log.Panicf("player: %s", err)
-	}
-	p.hitbox.PushHitbox(hurtbox, hitbox.Hit, nil)
-	p.hitbox.HitFunc = func(other core.Entity, _ *bump.Collision, damage float64, contactType hitbox.ContactType) {
-		switch contactType {
-		case hitbox.Hit:
-			p.Hurt(other, damage, p.reactForce)
-			vars.World.Camera.Shake(0.5, 1)
-			vars.World.Freeze(0.1)
-		case hitbox.Block, hitbox.ParryBlock:
-			p.Block(other, damage, p.reactForce, contactType)
-		}
-	}
-}
-
-func (p *Player) Update(dt float64) {
-	if p.stats.Health > 0 {
-		p.input(dt)
-		p.heavyAttackUpdate()
-	}
-	p.SimpleUpdate(dt)
-	if p.stats.Health > 0 {
-		if moving := vars.Pad.KeyDown(utils.KeyLeft) || vars.Pad.KeyDown(utils.KeyRight); !moving && p.anim.State == vars.WalkTag {
-			p.anim.SetState(vars.IdleTag)
-		}
-	}
-}
-
-func (p *Player) heavyAttackUpdate() {
-	if attacking := strings.HasPrefix(p.anim.State, vars.AttackTag); !attacking {
-		return
-	}
-	holdAnim := p.anim.Data.Animation(p.anim.State + "Hold") // TODO: define a name
-	if holdAnim == nil {
-		return
+// NewPlayerPrefab constructs a player entity.
+//
+// The player is FULLY MIGRATED to Pure ECS (Phase 2 complete - no Control component).
+// All combat, movement, and state management is handled through dedicated systems.
+//
+// The player has a complex multi-system lifecycle:
+//  1. Input: Keyboard/gamepad input processed each frame
+//  2. Movement: Horizontal walk, jump, climb, dash mechanics
+//  3. Combat: Light/heavy attacks, blocking, parrying, healing
+//  4. Animation: State-driven sprite animation with attack holds
+//  5. Stats: Health, stamina, poise, healing charges with HUD display
+//
+// Systems involved:
+//   - systems/update/player.go: Main input, movement, guard state, and attack execution (Phase 8: consolidated)
+//   - systems/update/player_hurt.go: Damage reaction (Hit events)
+//   - systems/update/player_block.go: Block/parry reaction (Block/ParryBlock events)
+//   - systems/update/player_combat_effects.go: Camera shake, freeze, visual effects
+//
+// Parameters:
+//   - world: ECS world instance (required)
+//   - x, y: Spawn position in world coordinates
+//
+// Returns: EntityId of the created player, or 0 if world is nil
+func NewPlayerPrefab(world *ecs.World, x, y float64) entities.EntityId {
+	if world == nil {
+		return 0
 	}
 
-	startingFrames := holdAnim.From - p.anim.Data.CurrentAnimation.From
-	frame := p.anim.Data.CurrentFrame
-	if inHold := frame >= holdAnim.From && frame <= holdAnim.To; inHold {
-		p.attackLevel = float64(frame-holdAnim.From+startingFrames) / float64(holdAnim.To-holdAnim.From+startingFrames) // 0, 0.5, 1 || 0, 0.33, 0.66, 1
-		if vars.Pad.KeyReleased(utils.KeyAction) {
-			p.anim.Data.CurrentFrame = holdAnim.To + 2
-			p.anim.Data.FrameCounter = 0
-		}
-	} else if p.anim.Data.CurrentFrame == holdAnim.From-startingFrames && vars.Pad.KeyReleased(utils.KeyAction) {
-		p.anim.Data.CurrentFrame = holdAnim.To + 1
-	}
-}
-
-func (p *Player) input(dt float64) {
-	actionPressed := vars.Pad.KeyPressedBuffered(utils.KeyAction, keyBufferDuration)
-	healPressed := vars.Pad.KeyPressedBuffered(utils.KeyHeal, keyBufferDuration)
-	dashPressed := vars.Pad.KeyPressedBuffered(utils.KeyDash, keyBufferDuration)
-	if p.PausingState() && p.anim.State != vars.ConsumeTag {
-		return
-	}
-	if actionPressed() {
-		p.MultAttack(vars.AttackTag, playerDamage, playerDamage, p.reactForce, p.attackPushForce, &p.attackLevel)
-	}
-	if healPressed() {
-		p.Heal()
-	}
-	if dashPressed() {
-		speed := p.body.MaxX * 4
-		if (!p.anim.FlipX && !vars.Pad.KeyDown(utils.KeyRight)) || vars.Pad.KeyDown(utils.KeyLeft) {
-			speed *= -1
-		}
-		p.body.Vx = speed
-	}
-	if vars.Pad.KeyDown(utils.KeyGuard) {
-		p.ShieldUp()
-	}
-	if vars.Pad.KeyReleased(utils.KeyGuard) {
-		p.ShieldDown()
-	}
-	p.inputClimbing(dt)
-
-	flip := p.anim.FlipX
-	speed := p.speed
-	if !p.body.Ground {
-		speed /= 2
-	}
-	if vars.Pad.KeyDown(utils.KeyLeft) {
-		if math.Abs(p.body.Vx) <= p.body.MaxX {
-			p.body.Vx -= speed * dt
-		}
-		flip = false
-	}
-	if vars.Pad.KeyDown(utils.KeyRight) {
-		if math.Abs(p.body.Vx) <= p.body.MaxX {
-			p.body.Vx += speed * dt
-		}
-		flip = true
+	// Get config from ECS world
+	cfg := ecs.Resource[config.Config](world)
+	if cfg == nil {
+		cfg = config.NewDefaultConfig()
 	}
 
-	if !p.BlockingState() {
-		p.anim.FlipX = flip
-	}
-	if vars.Pad.KeyPressed(utils.KeyJump) && p.CanJump() {
-		p.ClimbOff()
-		p.stats.AddStamina(-jumpingStamina)
-		p.body.Vy = -p.jumpSpeed
-	}
+	// Create ECS entity
+	eid := world.NewEntity()
 
-	if vars.Debug {
-		if inpututil.IsKeyJustPressed(ebiten.KeyTab) {
-			p.stats.Heal = p.stats.MaxHeal
-		}
+	// === SPATIAL COMPONENT ===
+	// Position and dimensions
+	transform := &components.Transform{
+		X: x,
+		Y: y,
+		W: playerWidth,
+		H: playerHeight,
 	}
-}
+	world.AddComponent(eid, transform)
 
-func (p *Player) inputClimbing(dt float64) {
-	if vars.Pad.KeyDown(utils.KeyUp) || vars.Pad.KeyDown(utils.KeyDown) {
-		p.ClimbOn(vars.Pad.KeyDown(utils.KeyDown))
+	// === VISUAL COMPONENT ===
+	// Animation with sprite offsets
+	anim := NewAnimationComponent(AnimationConfig{
+		FilesName:  playerAnimFile,
+		OX:         playerOffsetX,
+		OY:         playerOffsetY,
+		OXFlip:     playerOffsetFlip,
+		Layer:      5, // Player renders above most entities
+		FSMInitial: "Idle",
+		FSMTransitions: map[string]string{
+			"ParryBlock": "Block", // ParryBlock (1 frame) transitions to Block (hold state)
+			"Block":      "Block", // Block loops to itself (hold state while button held)
+			"Climb":      "Climb", // Climb loops to itself (hold state while on ladder)
+		},
+	})
+	if anim == nil {
+		world.DestroyEntity(eid)
+		return 0
 	}
-	if p.anim.State != vars.ClimbTag {
-		return
-	}
-	if !p.body.InsidePassThrough {
-		p.Control.ClimbOff()
+	world.AddComponent(eid, anim)
 
-		return
+	// === COLLISION COMPONENT ===
+	// Hitbox will be initialized in systems/update/player.go from animation slice data
+	hitbox := &components.Hitbox{}
+	world.AddComponent(eid, hitbox)
+
+	// === STATS COMPONENTS (Pure ECS Pattern) ===
+	// Health component
+	health := &components.Health{
+		Current: playerMaxHealth,
+		Max:     playerMaxHealth,
+		Lag:     playerMaxHealth,
 	}
-	speed := p.speed * playerClimbSpeed * dt
-	p.body.Vx = 0
-	if vars.Pad.KeyDown(utils.KeyLeft) {
-		p.body.Vx = -speed
+	world.AddComponent(eid, health)
+
+	// Stamina component (for attacks, dodges, blocking)
+	stamina := &components.Stamina{
+		Current:      playerMaxStamina,
+		Max:          playerMaxStamina,
+		Lag:          playerMaxStamina,
+		RecoveryRate: cfg.Stats.RecoverRate,
 	}
-	if vars.Pad.KeyDown(utils.KeyRight) {
-		p.body.Vx = speed
+	world.AddComponent(eid, stamina)
+
+	// Poise component (knockback/stagger resistance)
+	poise := &components.Poise{
+		Current:        playerDefaultPoise,
+		Max:            playerDefaultPoise,
+		Lag:            playerDefaultPoise,
+		RecoverSeconds: cfg.Stats.RecoverSeconds,
 	}
-	p.body.Vy = 0
-	if vars.Pad.KeyDown(utils.KeyUp) {
-		p.body.Vy = -speed
+	world.AddComponent(eid, poise)
+
+	// Healing component (heal charges and amounts)
+	healing := &components.Healing{
+		Count:      playerMaxHeal,
+		MaxCount:   playerMaxHeal,
+		HealAmount: cfg.Stats.HealAmount,
 	}
-	if vars.Pad.KeyDown(utils.KeyDown) {
-		p.body.Vy = speed
+	world.AddComponent(eid, healing)
+
+	// Experience component (not used yet, but consistent with enemies)
+	experience := &components.Experience{Points: 0}
+	world.AddComponent(eid, experience)
+
+	// Attack multiplier (bonus damage from consuming heals)
+	attackMult := &components.AttackMultiplier{
+		Current: 0,
+		PerHeal: 0.2, // Default: +20% damage per heal consumed
 	}
+	world.AddComponent(eid, attackMult)
+
+	// === NEW PHYSICS COMPONENT (Phase 2) ===
+	// Player physics with custom max velocity
+	physics := spatial.NewPhysics()
+	physics.Weight = playerWeight
+	physics.MaxVelocity.X = playerDefaultMaxX
+	physics.GravityEnabled = true
+	physics.FrictionEnabled = true
+	world.AddComponent(eid, physics)
+
+	// === NEW COLLIDER COMPONENT (Phase 2) ===
+	// Player collider (solid, player team)
+	collider := &components.Collider{
+		Tags:      []string{"player", "body"},
+		QueryTags: []string{"enemy", "body", "map", "solid", "passthrough"},
+		Solid:     true,
+		Immovable: false,
+		OffsetX:   0,
+		OffsetY:   0,
+		Width:     0, // Use Transform size
+		Height:    0, // Use Transform size
+		FilterOut: []entities.EntityId{},
+	}
+	world.AddComponent(eid, collider)
+
+	// === TEAM COMPONENT ===
+	team := &components.Team{Type: components.TeamPlayer}
+	world.AddComponent(eid, team)
+
+	// === INPUT COMPONENT ===
+	// Keyboard/gamepad input state (Pure ECS: pure data component)
+	// Uses configurable key bindings from config file
+	input := &components.Input{
+		KeyBindings: preupdate.KeyBindingsFromWorld(world),
+	}
+	world.AddComponent(eid, input)
+
+	// Action tracking for input buffering
+	actions := &components.ActionIntents{}
+	world.AddComponent(eid, actions)
+
+	// === FACING COMPONENT ===
+	// Sprite direction (controlled by input, not AI)
+	facing := &components.Facing{FlipX: false}
+	world.AddComponent(eid, facing)
+
+	// === BEHAVIOR COMPONENT ===
+	// Player-specific state (Pure ECS: only data fields)
+	player := &components.Player{
+		// Gameplay tuning
+		Speed:           playerDefaultSpeed,
+		JumpSpeed:       playerDefaultJumpSpeed,
+		JumpCost:        playerDefaultJumpCost,
+		ClimbSpeed:      playerDefaultClimbSpeed,
+		AttackDamage:    playerDefaultDamage,
+		ReactForce:      0,
+		AttackPushForce: 0,
+		AttackLevel:     0,
+	}
+	world.AddComponent(eid, player)
+
+	return eid
 }

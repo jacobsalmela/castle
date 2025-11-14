@@ -1,99 +1,122 @@
-package entity
+package prefabs
 
 import (
-	"game/comps/ai"
-	"game/comps/anim"
-	"game/comps/body"
-	"game/comps/hitbox"
-	"game/comps/stats"
-	"game/core"
-	"game/entity/actor"
-	"game/libs/bump"
-	"game/vars"
+	"game/components"
+	"game/ecs"
+	"game/entities"
 )
 
 const (
-	crawlerAnimFile                                   = "crawler"
-	crawlerWidth, crawlerHeight                       = 11, 8
-	crawlerOffsetX, crawlerOffsetY, crawlerOffsetFlip = -4, -4, 10
-	crawlerHealth, crawlerDamage                      = 30, 15
-	crawlerSpeed                                      = 100
-	crawlerExp                                        = 10
+	// Visual properties
+	crawlerAnimFile = "crawler" // Animation file base name
+	crawlerWidth    = 11        // Collision width in pixels
+	crawlerHeight   = 8         // Collision height in pixels
+
+	// Sprite offset configuration
+	crawlerOffsetX    = -4 // Sprite offset when facing right
+	crawlerOffsetY    = -4 // Vertical sprite offset
+	crawlerOffsetFlip = 10 // Sprite offset when facing left
+
+	// Physics properties
+	crawlerWeight = 0.8 // Weight for gravity/knockback
+
+	// Combat stats
+	crawlerHealth = 30 // Hit points
+	crawlerPoise  = 15 // Knockback resistance
+	crawlerExp    = 10 // Experience points on death
+
+	// Visual effect durations
+	crawlerFlashDuration = 0.8 // Flash effect duration in seconds
+	crawlerDieDuration   = 1.0 // Death fade duration in seconds
 )
 
-type Crawler struct {
-	*core.BaseEntity
-	*actor.Control
-	anim   *anim.Comp
-	body   *body.Comp
-	hitbox *hitbox.Comp
-	stats  *stats.Comp
-	ai     *ai.Comp
-}
+// NewCrawlerPrefab constructs a Crawler entity using the shared enemy factory.
+//
+// Crawlers are ground-based melee enemies with a patrol-and-attack pattern:
+//  1. Idle: Stand still, scan patrol area for targets
+//  2. Patrol: Walk back and forth within view area
+//  3. Chase: Move toward target when detected
+//  4. Attack: Melee attack when target is in range
+//
+// Parameters:
+//   - world: ECS world instance (required)
+//   - x, y: Spawn position in world coordinates
+//   - w, h: UNUSED - Kept for tilemap.EntityConstructor interface compatibility
+//   - flipX: Initial sprite facing direction (true = left, false = right)
+//
+// Returns: EntityId of the created crawler, or 0 if world is nil
+func NewCrawlerPrefab(world *ecs.World, x, y, w, h float64, flipX bool) entities.EntityId {
+	config := EnemyConfig{
+		// Animation
+		AnimFile:   crawlerAnimFile,
+		OffsetX:    crawlerOffsetX,
+		OffsetY:    crawlerOffsetY,
+		OffsetFlip: crawlerOffsetFlip,
 
-func NewCrawler(x, y, _, _ float64, props *core.Properties) *Crawler {
-	crawler := &Crawler{
-		BaseEntity: &core.BaseEntity{X: x, Y: y, W: crawlerWidth, H: crawlerHeight},
-		anim: &anim.Comp{
-			FilesName: crawlerAnimFile,
-			OX:        crawlerOffsetX, OY: crawlerOffsetY,
-			OXFlip: crawlerOffsetFlip,
-			FlipX:  props.FlipX,
+		// Animation behavior
+		AnimLayer:      5,
+		AnimFSMInitial: "Idle",
+		AnimFSMTransitions: map[string]string{
+			"Attack": "Idle",
 		},
-		body:   &body.Comp{},
-		hitbox: &hitbox.Comp{},
-		stats:  &stats.Comp{MaxHealth: crawlerHealth, MaxPoise: crawlerDamage, Exp: crawlerExp},
-		ai:     &ai.Comp{},
-	}
-	crawler.Add(crawler.anim, crawler.body, crawler.hitbox, crawler.stats, crawler.ai)
-	crawler.Control = actor.NewControl(crawler)
 
-	var view *bump.Rect
-	if props.View != nil {
-		viewRect := bump.NewRect(props.View.X, props.View.Y, props.View.Width, props.View.Height)
-		view = &viewRect
-	}
-	if aiProp, ok := props.Custom["ai"]; !ok || (aiProp != "" && aiProp != "none") {
-		if aiProp == "move_left" {
-			crawler.ai.SetAct(func() {
-				crawler.ai.Add(0, actor.IdleAction(crawler.Control, view))
-				crawler.ai.Add(0, &ai.Action{
-					Name: "MoveLeft",
-					Next: func(dt float64) bool {
-						crawler.ai.Target = nil
-						crawler.anim.FlipX = false
-						if !crawler.PausingState() {
-							crawler.body.Vx -= crawlerSpeed * dt
-						}
+		// Dimensions
+		Width:  crawlerWidth,
+		Height: crawlerHeight,
 
-						return false
-					},
-				})
-			})
-		} else {
-			crawler.ai.SetAct(func() { crawler.aiScript(view) })
-		}
+		// Physics
+		Weight:          crawlerWeight,
+		GravityEnabled:  true,
+		FrictionEnabled: true,
+		MaxVelocityX:    80.0, // Match approach behavior max speed
+
+		// Stats
+		Health: crawlerHealth,
+		Poise:  crawlerPoise,
+		Exp:    crawlerExp,
+
+		// Visual effects
+		FlashDuration: crawlerFlashDuration,
+		FlashColor:    [3]float32{1, 1, 1}, // White
+		DieDuration:   crawlerDieDuration,
+
+		// Detection (360° vision, 1.5x entity size in all directions)
+		DetectionFront: 16.5, // 1.5 * crawlerWidth
+		DetectionBack:  16.5,
+		DetectionUp:    12.0, // 1.5 * crawlerHeight
+		DetectionDown:  12.0,
+
+		// Optional behavior components
+		ApproachBehavior: &components.ApproachBehavior{
+			Speed:           100.0,
+			MaxSpeed:        80.0,
+			MinRange:        20.0,
+			RangeAdjustment: 0.0,
+		},
+		BackupBehavior: &components.BackupBehavior{
+			Speed:    100.0,
+			MaxRange: 40.0,
+		},
+		MeleeAttackBehavior: &components.MeleeAttackBehavior{
+			Damage:       15.0,
+			PushForce:    10.0,
+			ReactForce:   10.0,
+			AnimationTag: "Attack",
+		},
 	}
 
-	return crawler
+	// Create enemy with Crawler-specific component
+	return NewEnemyPrefab(world, x, y, flipX, config, &components.Crawler{
+		AiMode: "", // Set via SetCrawlerAiMode if needed
+		Paused: false,
+		// RemovalTarget set automatically by factory
+	})
 }
 
-func (c *Crawler) Comps() (anim *anim.Comp, body *body.Comp, hitbox *hitbox.Comp, stats *stats.Comp, ai *ai.Comp) {
-	return c.anim, c.body, c.hitbox, c.stats, c.ai
-}
-
-func (c *Crawler) Update(dt float64) {
-	c.SimpleUpdate(dt)
-}
-
-//nolint:mnd
-func (c *Crawler) aiScript(view *bump.Rect) {
-	c.ai.Add(0, actor.IdleAction(c.Control, view))
-	c.ai.Add(0, actor.ApproachAction(c.Control, crawlerSpeed, vars.DefaultMaxX, 0))
-
-	ai.Choices{
-		{1, func() { c.ai.Add(5, actor.AttackAction(c.Control, "Attack", crawlerDamage)) }},
-		{1, func() { c.ai.Add(1.5, actor.BackUpAction(c.Control, crawlerSpeed, 0)) }},
-		{1, func() { c.ai.Add(0.6, actor.WaitAction()) }},
-	}.Play()
+// SetCrawlerAiMode sets the AI behavior mode for a crawler entity.
+// Common modes: "patrol", "wall" (wall-climbing)
+func SetCrawlerAiMode(world *ecs.World, eid entities.EntityId, aiMode string) {
+	if crawler := ecs.GetComponent[components.Crawler](world, eid); crawler != nil {
+		crawler.AiMode = aiMode
+	}
 }

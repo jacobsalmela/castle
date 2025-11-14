@@ -1,60 +1,135 @@
-package entity
+package prefabs
 
 import (
-	"game/comps/ai"
-	"game/comps/anim"
-	"game/comps/body"
-	"game/comps/hitbox"
-	"game/comps/stats"
-	"game/comps/textbox"
-	"game/core"
-	"game/entity/actor"
-	"game/libs/bump"
+	"game/components"
+	"game/components/spatial"
+	"game/ecs"
+	"game/entities"
+	"game/pkg/bump"
 )
 
 const (
+	// Visual properties
 	gramAnimFile                             = "gram"
 	gramWidth, gramHeight                    = 10, 12
 	gramOffsetX, gramOffsetY, gramOffsetFlip = -1, -2, 6
+
+	// Combat stats - Gram is invulnerable (no Health)
+	gramMaxPoise = 100 // Maximum poise
+	gramPoise    = 100 // Starting poise
 )
 
-type Gram struct {
-	*core.BaseEntity
-	*actor.Control
-	anim   *anim.Comp
-	body   *body.Comp
-	hitbox *hitbox.Comp
-	stats  *stats.Comp
-}
+// NewGramPrefab creates a Gram NPC entity with dialogue.
+// Returns an ECS EntityId instead of core.Entity.
+//
+// Gram is an invulnerable passive NPC (no Health component).
+// - Takes poise damage for hit reactions
+// - Cannot be killed
+// - Shows poise bar when hit (via HeadHealthTimer)
+// - Fully Pure ECS - no Control component
+//
+// Dimensions: 10x12 pixels
+// Combat: Poise=100/100 (invulnerable, no Health)
+// Special: Unmovable passive NPC with textbox dialogue
+//
+// Use SetGramText() to set dialogue text after creation.
+func NewGramPrefab(world *ecs.World, x, y, w, h float64, flipX bool) entities.EntityId {
+	if world == nil {
+		return 0
+	}
 
-func NewGram(x, y, _, _ float64, props *core.Properties) *Gram {
-	gram := &Gram{
-		BaseEntity: &core.BaseEntity{X: x, Y: y, W: gramWidth, H: gramHeight},
-		anim:       &anim.Comp{FilesName: gramAnimFile, OX: gramOffsetX, OY: gramOffsetY, OXFlip: gramOffsetFlip, FlipX: props.FlipX},
-		body:       &body.Comp{Unmovable: true},
-		hitbox:     &hitbox.Comp{},
-		stats:      &stats.Comp{},
+	eid := world.NewEntity()
+
+	// === SPATIAL COMPONENT ===
+	// Position and dimensions
+	transform := &components.Transform{X: x, Y: y, W: gramWidth, H: gramHeight}
+	world.AddComponent(eid, transform)
+
+	// === ANIMATION COMPONENT ===
+	// Animation component - created using Pure ECS helper
+	anim := NewAnimationComponent(AnimationConfig{
+		FilesName:      gramAnimFile,
+		OX:             gramOffsetX,
+		OY:             gramOffsetY,
+		OXFlip:         gramOffsetFlip,
+		Layer:          1,
+		FSMInitial:     "Idle",
+		FSMTransitions: make(map[string]string),
+	})
+	if anim == nil {
+		world.DestroyEntity(eid)
+		return 0
 	}
-	text := "Hello, I'm Gramr, nice to meet you"
-	if props.Custom["text"] != "" {
-		text = props.Custom["text"]
+	world.AddComponent(eid, anim)
+
+	// === COMBAT COMPONENTS ===
+	// Hitbox for receiving damage - initialized immediately with hurtbox from animation
+	hitbox := &components.Hitbox{}
+	addHurtboxToHitbox(anim, hitbox)
+	world.AddComponent(eid, hitbox)
+
+	// Poise - hit reactions and stagger (NO HEALTH - invulnerable)
+	poise := &components.Poise{
+		Current:        gramPoise,
+		Max:            gramMaxPoise,
+		RecoverSeconds: 3.0, // Recover poise after 3 seconds
 	}
-	textbox := &textbox.Comp{
-		Text:      text,
-		Indicator: true,
+	world.AddComponent(eid, poise)
+
+	// HeadHealthTimer - controls when poise bar is visible
+	headHealthTimer := &components.HeadHealthTimer{}
+	world.AddComponent(eid, headHealthTimer)
+
+	// === DIALOGUE COMPONENT ===
+	// Textbox component with default text and interaction area
+	textboxData := &components.TextboxData{
+		Text:      "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
+		Indicator: true, // Show position indicator
 		Area: func() bump.Rect {
-			return bump.NewRect(gram.X-gramWidth*2, gram.Y-gramHeight, gramWidth*4, gramHeight*2)
+			return bump.NewRect(x-gramWidth*2, y-gramHeight, gramWidth*4, gramHeight*2)
 		},
+		AdvanceFlicker:      false,
+		AdvanceFlickerTimer: 0,
+		Active:              false,
 	}
-	gram.stats.MaxPoise, gram.stats.Poise = 100, 100
-	gram.Add(gram.anim, gram.body, gram.hitbox, gram.stats, textbox)
-	gram.Control = actor.NewControl(gram)
+	// Store entity bounds for indicator positioning
+	textboxData.EntityX = x
+	textboxData.EntityY = y
+	textboxData.EntityW = gramWidth
+	textboxData.EntityH = gramHeight
+	world.AddComponent(eid, textboxData)
 
-	return gram
+	// === PHYSICS COMPONENT ===
+	// Static physics - boss NPC never moves
+	physics := spatial.NewPhysicsStatic()
+	world.AddComponent(eid, physics)
+
+	// === COLLISION COMPONENT ===
+	// Solid collider - blocks player movement
+	collider := &components.Collider{
+		Tags:      []string{"body", "solid"},
+		QueryTags: []string{},
+		Solid:     true,
+		Immovable: true, // Static boss
+		OffsetX:   0,
+		OffsetY:   0,
+		Width:     0, // Use Transform size
+		Height:    0, // Use Transform size
+		FilterOut: []entities.EntityId{},
+	}
+	world.AddComponent(eid, collider)
+
+	// === FACING COMPONENT ===
+	// Facing component for sprite orientation (used by hitbox init)
+	facing := &components.Facing{FlipX: flipX}
+	world.AddComponent(eid, facing)
+
+	// === BEHAVIOR COMPONENT ===
+	gram := &components.Gram{}
+	world.AddComponent(eid, gram)
+
+	return eid
 }
 
-func (g *Gram) Comps() (anim *anim.Comp, body *body.Comp, hitbox *hitbox.Comp, stats *stats.Comp, ai *ai.Comp) {
-	return g.anim, g.body, g.hitbox, g.stats, nil
-}
-
-func (g *Gram) Update(_ float64) {}
+// NOTE: SetGramText has been removed.
+// Use ui.UpdateTextboxText(world, eid, text) instead.

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<tileset version="1.10" tiledversion="1.10.2" name="tiles" tilewidth="8" tileheight="8" tilecount="3844" columns="62" objectalignment="topleft">
+<tileset version="1.11" tiledversion="1.11.2" name="tiles" tilewidth="8" tileheight="8" tilecount="3844" columns="62" objectalignment="topleft">
  <image source="tiles.png" width="500" height="500"/>
  <tile id="377">
   <animation>
@@ -11,6 +11,13 @@
    <frame tileid="749" duration="100"/>
   </animation>
  </tile>
+ <tile id="397">
+  <objectgroup draworder="index" id="2">
+   <object id="1" x="0" y="0" width="8" height="8"/>
+  </objectgroup>
+ </tile>
+ <tile id="400" type="ladder"/>
+ <tile id="462" type="ladder"/>
  <tile id="566">
   <animation>
    <frame tileid="806" duration="200"/>

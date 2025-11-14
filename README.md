@@ -1,15 +1,9 @@
-# castle
-
-A 2D Dark Souls like game made in Go
-
-[itch.io link](https://master-both.itch.io/castle)
-
-![Game mockup with pixel art](extras/castle.png)
+<p align="center">
+  <img src="assets/images/thirdparty/castle.png" alt="chronovian thanatome">
+  <br>
+  <strong>A 2D metroidvania/platformer written in Go</strong>
+</p>
 
 ## About
 
-This is a personal project started as a way to learn Go
-
-### Aseprite
-
-- To export sprites, these setting must be select: `trim sprite` and `extrude`. Nothing more.
+Forked from [Castle](https://github.com/npinochet/castle) by [Nicolás Pinochet](https://github.com/npinochet).

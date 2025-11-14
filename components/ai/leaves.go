@@ -1,121 +1,104 @@
 package ai
 
 import (
-	"game/assets"
-	"game/comps/stats"
-	"game/core"
-	"game/libs/bump"
-	"game/utils"
-	"game/vars"
-	"image/color"
-	"math"
-
-	"github.com/hajimehoshi/ebiten/v2"
+	"game/ecs"
+	"game/entities"
 )
 
-var DebugDraw = false
+// Condition is a leaf node that evaluates a condition and returns Success or Failure.
+// Conditions should never return Running - they're instantaneous checks.
+//
+// Use case: Checking game state without modifying it.
+// Example: "Is player in range?", "Do I have ammo?", "Am I grounded?"
+type Condition struct {
+	// Check is called to evaluate the condition.
+	// Should return true for Success, false for Failure.
+	Check func(world *ecs.World, eid entities.EntityId) bool
+}
 
+func (c *Condition) Tick(world *ecs.World, eid entities.EntityId, dt float64) Status {
+	if c.Check == nil {
+		return Failure
+	}
+
+	if c.Check(world, eid) {
+		return Success
+	}
+	return Failure
+}
+
+// Action is a leaf node that performs an action and may take multiple frames to complete.
+// Actions can return Success, Failure, or Running.
+//
+// Use case: Doing something in the game world.
+// Example: "Move toward target", "Play attack animation", "Fire weapon"
 type Action struct {
-	Name        string
-	Next        func(dt float64) bool
-	Entry, Exit func()
+	// OnStart is called once when the action begins (optional).
+	OnStart func(world *ecs.World, eid entities.EntityId)
+
+	// OnTick is called every frame while the action is running.
+	// Should return the current status of the action.
+	OnTick func(world *ecs.World, eid entities.EntityId, dt float64) Status
+
+	// OnEnd is called once when the action completes (optional).
+	// Called regardless of whether action succeeded or failed.
+	OnEnd func(world *ecs.World, eid entities.EntityId)
+
+	started bool
 }
 
-type actionItem struct {
-	action *Action
-	timer  float64
-}
-
-type Comp struct {
-	core.Entity
-	Target      core.Entity
-	act         func()
-	actionQueue []actionItem
-	DebugRect   *bump.Rect
-}
-
-func (c *Comp) Init(entity core.Entity) {
-	c.Entity = entity
-}
-
-func (c *Comp) Remove() {}
-
-func (c *Comp) SetAct(act func()) { c.act = act }
-
-func (c *Comp) Add(timeout float64, action *Action) {
-	if timeout <= 0 {
-		timeout = math.MaxFloat64
-	}
-	if action.Next == nil {
-		action.Next = func(_ float64) bool { return false }
-	}
-	c.actionQueue = append(c.actionQueue, actionItem{action, timeout})
-	if len(c.actionQueue) == 1 && action.Entry != nil {
-		action.Entry()
-	}
-}
-
-func (c *Comp) Update(dt float64) {
-	if c.Target != nil {
-		if stats := core.Get[*stats.Comp](c.Target); stats != nil && stats.Health <= 0 {
-			c.Target = nil
+func (a *Action) Tick(world *ecs.World, eid entities.EntityId, dt float64) Status {
+	// Call OnStart on first tick
+	if !a.started {
+		a.started = true
+		if a.OnStart != nil {
+			a.OnStart(world, eid)
 		}
 	}
-	if len(c.actionQueue) == 0 {
-		if c.act != nil {
-			c.act()
-		}
-		if len(c.actionQueue) == 0 {
-			return
+
+	// Execute the action
+	var status Status
+	if a.OnTick != nil {
+		status = a.OnTick(world, eid, dt)
+	} else {
+		status = Success // No tick function means instant success
+	}
+
+	// Call OnEnd when action completes
+	if status != Running {
+		a.started = false
+		if a.OnEnd != nil {
+			a.OnEnd(world, eid)
 		}
 	}
-	item := &c.actionQueue[0]
-	item.timer -= dt
-	if item.timer <= 0 || item.action.Next(dt) {
-		if item.action.Exit != nil {
-			item.action.Exit()
-		}
-		if c.actionQueue = c.actionQueue[1:]; len(c.actionQueue) > 0 {
-			if nextItem := c.actionQueue[0]; nextItem.action.Entry != nil {
-				nextItem.action.Entry()
-			}
-		}
-	}
+
+	return status
 }
 
-func (c *Comp) Draw(pipeline *core.Pipeline, entityPos ebiten.GeoM) {
-	if !DebugDraw || len(c.actionQueue) == 0 {
-		return
-	}
-	op := &ebiten.DrawImageOptions{GeoM: entityPos}
-	op.GeoM.Translate(-5, -10)
-	pipeline.Add(vars.PipelineScreenTag, vars.PipelineUILayer, func(screen *ebiten.Image) {
-		utils.DrawText(screen, "AI:"+c.actionQueue[0].action.Name, assets.NanoFont, op)
-		if c.DebugRect != nil {
-			image := ebiten.NewImage(int(c.DebugRect.W), int(c.DebugRect.H))
-			image.Fill(color.NRGBA{255, 255, 0, 75})
-			op := &ebiten.DrawImageOptions{}
-			cx, cy := vars.World.Camera.Position()
-			op.GeoM.Translate(c.DebugRect.X-cx, c.DebugRect.Y-cy)
-			screen.DrawImage(image, op)
-		}
-	})
+func (a *Action) Reset() {
+	a.started = false
 }
 
-func (c *Comp) InTargetRange(minDist, maxDist float64) bool {
-	if c.Target == nil {
-		return false
-	}
+// AlwaysSuccess is a leaf node that always returns Success.
+// Useful as a fallback or placeholder.
+type AlwaysSuccess struct{}
 
-	x, y := c.Position()
-	tx, ty := c.Target.Position()
-	dist := utils.Distante(x, y, tx, ty)
+func (a *AlwaysSuccess) Tick(world *ecs.World, eid entities.EntityId, dt float64) Status {
+	return Success
+}
 
-	in := dist >= minDist
-	out := true
-	if maxDist > 0 {
-		out = dist <= maxDist
-	}
+// AlwaysFailure is a leaf node that always returns Failure.
+// Useful for testing or placeholders.
+type AlwaysFailure struct{}
 
-	return in && out
+func (a *AlwaysFailure) Tick(world *ecs.World, eid entities.EntityId, dt float64) Status {
+	return Failure
+}
+
+// AlwaysRunning is a leaf node that always returns Running.
+// Useful for blocking a branch or testing.
+type AlwaysRunning struct{}
+
+func (a *AlwaysRunning) Tick(world *ecs.World, eid entities.EntityId, dt float64) Status {
+	return Running
 }

@@ -1,156 +1,280 @@
-package entity
+package prefabs
 
 import (
-	"game/assets"
-	"game/comps/body"
-	"game/comps/hitbox"
-	"game/comps/render"
-	"game/core"
-	"game/ext"
-	"game/libs/bump"
-	"game/vars"
 	"log"
 	"math"
 	"math/rand/v2"
 	"strconv"
 
+	"game/assets"
+	"game/components"
+	"game/components/spatial"
+	"game/ecs"
+	"game/entities"
+	"game/pkg/bump"
+	"game/pkg/config"
+	"game/pkg/tilemap"
+	"game/resources"
+
 	"github.com/hajimehoshi/ebiten/v2"
-	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 )
 
-type Object struct {
-	*core.BaseEntity
-	body                 *body.Comp
-	hitbox               *hitbox.Comp
-	render, renderNormal *render.Comp
-	reward               int
-}
+const (
+	// Object collision properties
+	objectCollisionTag    = "object"
+	objectShrinkCollision = 1 // Shrink hitbox by this many pixels on each side
+)
 
-func init() { core.RegisterEntityName("Object", NewObject) }
-
-func NewObject(x, y, w, h float64, props *core.Properties) *Object {
-	image, normalImage := constructTileImages(x, y, w, h)
-	dx, dy := x-math.Floor(x/tileSize)*tileSize, y-math.Floor(y/tileSize)*tileSize
-	reward, _ := strconv.Atoi(props.Custom["reward"])
-	object := &Object{
-		BaseEntity:   &core.BaseEntity{X: x, Y: y, W: w, H: h},
-		body:         &body.Comp{Tags: []bump.Tag{"object"}},
-		hitbox:       &hitbox.Comp{},
-		render:       &render.Comp{Image: image, X: -dx, Y: -dy},
-		renderNormal: &render.Comp{Image: normalImage, X: -dx, Y: -dy, Normal: true},
-		reward:       reward,
+// NewObjectPrefab constructs a destructible object entity from tilemap data.
+//
+// Objects are multi-tile destructible environmental elements (crates, barrels, pots, etc)
+// that snap to the tile grid. When destroyed, they spawn particles (smoke, debris) and
+// reward flakes based on their reward property.
+//
+// Parameters:
+//   - world: ECS world instance (required)
+//   - x, y: Top-left position in world coordinates
+//   - w, h: Object dimensions (will be snapped to tile grid)
+//   - props: Tile properties from map (contains "reward" custom property)
+//
+// Returns: EntityId of the created entity, or 0 if world is nil
+func NewObjectPrefab(world *ecs.World, x, y, w, h float64, props *tilemap.Properties) entities.EntityId {
+	if world == nil {
+		return 0
 	}
-	object.Add(object.body, object.hitbox, object.render, object.renderNormal)
 
-	return object
-}
+	// Get resources
+	space := ecs.Resource[bump.Space](world)
+	mapRef := ecs.Resource[resources.MapRef](world)
+	if mapRef == nil || mapRef.Map == nil {
+		log.Panic("object: no active map available for tile lookup")
+	}
+	worldMap := mapRef.Map
 
-func (o *Object) Init() {
-	o.hitbox.HitFunc = o.hurt
-	const shrink = 1
-	o.hitbox.PushHitbox(bump.Rect{X: shrink, Y: shrink, W: o.W - shrink*2, H: o.H - shrink*2}, hitbox.Hit, nil)
-}
+	// Construct tile images from map
+	tileImage, normalImage := constructObjectTileImages(worldMap, space, x, y, w, h)
 
-func (o *Object) Update(_ float64) {
-	for _, e := range ext.QueryItems(o, bump.Rect{X: o.X, Y: o.Y - 1, W: o.W, H: 1}, "object") {
-		if e.Y+e.H <= o.Y && math.Abs(o.body.Vx) > math.Abs(e.body.Vx) {
-			e.body.Vx = o.body.Vx
+	// Calculate render offset (for multi-tile objects)
+	dx := x - math.Floor(x/TileSize)*TileSize
+	dy := y - math.Floor(y/TileSize)*TileSize
+
+	// Parse reward from properties
+	reward := 0
+	if props != nil && props.Custom != nil {
+		if rewardStr, ok := props.Custom["reward"]; ok {
+			reward, _ = strconv.Atoi(rewardStr)
 		}
 	}
+
+	// Create entity
+	entityID := world.NewEntity()
+
+	// === SPATIAL COMPONENT ===
+	transform := &components.Transform{
+		X: x,
+		Y: y,
+		W: w,
+		H: h,
+	}
+	world.AddComponent(entityID, transform)
+
+	// === VISUAL COMPONENT ===
+	// Render tile composite image
+	render := &components.Render{
+		Image:       tileImage,
+		NormalImage: normalImage,
+		X:           -dx,
+		Y:           -dy,
+		Layer:       *tilemap.LayerIndex,
+	}
+	world.AddComponent(entityID, render)
+
+	// === PHYSICS COMPONENT ===
+	// Objects can be pushed but have physics
+	physics := spatial.NewPhysics()
+	physics.GravityEnabled = true
+	physics.FrictionEnabled = true
+	physics.Weight = 1.0
+	world.AddComponent(entityID, physics)
+
+	// === COLLISION COMPONENT ===
+	// Solid collider that blocks movement
+	collider := &components.Collider{
+		Tags:      []string{objectCollisionTag},
+		QueryTags: []string{"body", "map", "solid", objectCollisionTag},
+		Solid:     true,
+		Immovable: false, // Can be pushed
+		OffsetX:   0,
+		OffsetY:   0,
+		Width:     0, // Use Transform size
+		Height:    0,
+		FilterOut: []entities.EntityId{},
+	}
+	world.AddComponent(entityID, collider)
+
+	// === HITBOX COMPONENT ===
+	// Can be hit by player attacks
+	hitbox := NewHitbox(
+		objectShrinkCollision,
+		objectShrinkCollision,
+		w-objectShrinkCollision*2,
+		h-objectShrinkCollision*2,
+	)
+	world.AddComponent(entityID, hitbox)
+
+	// === BEHAVIOR COMPONENT ===
+	// Object-specific state
+	object := &components.Object{
+		TileImage:   tileImage,
+		NormalImage: normalImage,
+		OffsetX:     -dx,
+		OffsetY:     -dy,
+		Reward:      reward,
+	}
+	world.AddComponent(entityID, object)
+
+	// === TEAM COMPONENT ===
+	world.AddComponent(entityID, &components.Team{Type: components.TeamNeutral})
+
+	return entityID
 }
 
-func (o *Object) hurt(other core.Entity, _ *bump.Collision, _ float64, _ hitbox.ContactType) {
-	for range 5 + rand.IntN(5) {
-		vars.World.Add(NewSmoke(o))
-		vars.World.Add(NewDebris(o))
-	}
-	for range o.reward {
-		vars.World.Add(NewFlake(o))
-	}
-	vars.World.Remove(o)
-}
+// constructObjectTileImages builds composite images from map tiles.
+// Objects can span multiple tiles, so we stitch them together into a single image.
+func constructObjectTileImages(worldMap *tilemap.Map, space *bump.Space, x, y, w, h float64) (*ebiten.Image, *ebiten.Image) {
+	// Snap to tile grid
+	x = math.Floor(x/TileSize) * TileSize
+	y = math.Floor(y/TileSize) * TileSize
+	w = math.Ceil(w/TileSize) * TileSize
+	h = math.Ceil(h/TileSize) * TileSize
 
-func constructTileImages(x, y, w, h float64) (*ebiten.Image, *ebiten.Image) {
-	x, y = math.Floor(x/tileSize)*tileSize, math.Floor(y/tileSize)*tileSize
-	w, h = math.Ceil(w/tileSize)*tileSize, math.Ceil(h/tileSize)*tileSize
+	// Create composite images
 	image := ebiten.NewImage(int(w), int(h))
 	normalImage := ebiten.NewImage(int(w), int(h))
-	for ty := y; ty < y+h; ty += tileSize {
-		for tx := x; tx < x+w; tx += tileSize {
-			tiles, err := vars.World.Map.TilesFromPosition(tx, ty, true, vars.World.Space)
+
+	// Iterate over tiles in the object's footprint
+	for ty := y; ty < y+h; ty += TileSize {
+		for tx := x; tx < x+w; tx += TileSize {
+			// Get tile from map (removeTiles=true to extract from map)
+			tiles, err := tilemap.TilesFromPosition(worldMap, tx, ty, true, space)
 			if err != nil {
-				log.Panic("object: Failed to get tiles from position: ", err)
+				log.Printf("object: Failed to get tiles from position (%f, %f): %v", tx, ty, err)
+				continue
 			}
+
+			// Build draw options with proper transforms
 			op := &ebiten.DrawImageOptions{}
-			tile := tiles[vars.PipelineScreenTag]
+			tile := tiles[config.PipelineScreenTag]
+
 			var sx, sy, dx, dy float64 = 1, 1, 0, 0
 			if tile.FlipR {
 				op.GeoM.Rotate(math.Pi / 2)
 				sx = -1
 			}
 			if tile.FlipX {
-				sx, dx = -1, tileSize
+				sx, dx = -1, TileSize
 				if tile.FlipR {
 					sx = 1
 				}
 			}
 			if tile.FlipY {
-				sy, dy = -1, tileSize
+				sy, dy = -1, TileSize
 			}
+
 			op.GeoM.Scale(sx, sy)
 			op.GeoM.Translate(tx-x+dx, ty-y+dy)
+
+			// Draw to composite images
 			image.DrawImage(tile.Image, op)
-			normalImage.DrawImage(tiles[vars.PipelineNormalMapTag].Image, op)
+			normalImage.DrawImage(tiles[config.PipelineNormalMapTag].Image, op)
 		}
 	}
 
 	return image, normalImage
 }
 
-const debrisDuration = 5.0
+// ===== PARTICLE PREFABS =====
+// These are spawned when objects are destroyed
 
-var debrisImage, _, _ = ebitenutil.NewImageFromFileSystem(assets.FS, "debris.png")
+const (
+	debrisDuration     = 5.0 // seconds debris lives
+	debrisSize         = 3   // pixels per side
+	debrisLayer        = 1   // render layer
+	debrisRotationRate = 4.0 // rotation speed multiplier
+)
 
-type Debris struct {
-	*core.BaseEntity
-	body                     *body.Comp
-	render                   *render.Comp
-	from                     core.Entity
-	randTargetW, randTargetH float64
-	timer                    float64
-	imageIndex               int
-	rotationSpeed            float64
+var debrisImage *ebiten.Image
+
+func init() {
+	debrisImage = assets.GetSpriteImage("debris")
 }
 
-func NewDebris(from core.Entity) *Debris {
-	imgW, imgH := debrisImage.Bounds().Dx(), debrisImage.Bounds().Dy()
-	x, y, w, h := from.Rect()
-	debris := &Debris{
-		BaseEntity:  &core.BaseEntity{X: x + w/2, Y: y + h/2, W: float64(imgW), H: float64(imgH)},
-		body:        &body.Comp{Tags: []bump.Tag{}, QueryTags: []bump.Tag{"map"}},
-		render:      &render.Comp{Image: debrisImage},
-		from:        from,
-		randTargetW: rand.Float64(), randTargetH: rand.Float64(),
-		timer:         debrisDuration * (0.5 + rand.Float64()),
-		rotationSpeed: RandSignedFloat() * 4 * math.Pi,
+// NewDebrisPrefab spawns a debris particle from a destroyed object.
+func NewDebrisPrefab(world *ecs.World, from entities.EntityId) entities.EntityId {
+	if world == nil || from == 0 {
+		return 0
 	}
-	debris.Add(debris.body, debris.render)
 
-	return debris
-}
-
-func (d *Debris) Init() {
-	vx := flakeSpawnMinX + rand.Float64()*(flakeSpawnMaxX-flakeSpawnMinX)
-	vy := flakeSpawnMinY + rand.Float64()*(flakeSpawnMaxY-flakeSpawnMinY)
-	d.body.Vx, d.body.Vy = vx, vy
-}
-
-func (d *Debris) Update(dt float64) {
-	if d.body.Ground {
-		d.rotationSpeed *= 0.98 * dt
+	// Get source entity transform
+	t := ecs.GetComponent[components.Transform](world, from)
+	if t == nil {
+		return 0
 	}
-	d.render.R += d.rotationSpeed * dt
-	if d.timer -= dt; d.timer <= 0 {
-		vars.World.Remove(d)
+
+	// Spawn at center of source
+	x := t.X + t.W/2
+	y := t.Y + t.H/2
+
+	// Create entity
+	eid := world.NewEntity()
+
+	// === SPATIAL COMPONENT ===
+	transform := &components.Transform{
+		X: x,
+		Y: y,
+		W: debrisSize,
+		H: debrisSize,
 	}
+	world.AddComponent(eid, transform)
+
+	// === VISUAL COMPONENT ===
+	render := &components.Render{
+		Image: debrisImage,
+		Layer: debrisLayer,
+	}
+	world.AddComponent(eid, render)
+
+	// === PHYSICS COMPONENT ===
+	physics := spatial.NewPhysics()
+	// Random initial velocity (from flake constants in original code)
+	vx := -50.0 + rand.Float64()*100.0 // flakeSpawnMinX to flakeSpawnMaxX
+	vy := -30.0 + rand.Float64()*40.0  // flakeSpawnMinY to flakeSpawnMaxY
+	physics.SetVelocity(vx, vy)
+	physics.GravityEnabled = true
+	physics.FrictionEnabled = true
+	physics.Weight = 1.0
+	world.AddComponent(eid, physics)
+
+	// === COLLISION COMPONENT ===
+	collider := &components.Collider{
+		Tags:      []string{},
+		QueryTags: []string{"map"},
+		Solid:     false, // Ghost collision
+		Immovable: false,
+		Width:     0, // Use Transform size
+		Height:    0,
+		FilterOut: []entities.EntityId{},
+	}
+	world.AddComponent(eid, collider)
+
+	// === BEHAVIOR COMPONENT ===
+	// Debris rotation and lifetime tracking
+	debris := &components.Debris{
+		Timer:         debrisDuration * (0.5 + rand.Float64()),
+		RotationSpeed: (rand.Float64() - 0.5) * 2 * debrisRotationRate * math.Pi,
+		ImageIndex:    0,
+	}
+	world.AddComponent(eid, debris)
+
+	return eid
 }

@@ -1,140 +1,131 @@
-package entity
+package prefabs
 
 import (
-	"game/comps/ai"
-	"game/comps/anim"
-	"game/comps/body"
-	"game/comps/hitbox"
-	"game/comps/stats"
-	"game/core"
-	"game/entity/actor"
-	"game/libs/bump"
-	"game/vars"
-	"strconv"
-	"time"
+	"game/components"
+	"game/ecs"
+	"game/entities"
 )
 
 const (
-	ghoulAnimFile                               = "ghoul"
-	ghoulWidth, ghoulHeight                     = 9, 13
-	ghoulOffsetX, ghoulOffsetY, ghoulOffsetFlip = -6.5, -4, 14
-	ghoulSpeed, ghoulMaxSpeed                   = 100, 40
-	ghoulHealth                                 = 70
-	ghoulDamage, ghoulPoise                     = 18, 21
-	ghoulExp                                    = 20
-	ghoulThrowFrame                             = 2
+	// Visual properties
+	ghoulAnimFile = "ghoul" // Animation file base name
+	ghoulWidth    = 9       // Collision width in pixels
+	ghoulHeight   = 13      // Collision height in pixels
+
+	// Sprite offset configuration
+	ghoulOffsetX    = -6.5 // Sprite offset when facing right
+	ghoulOffsetY    = -4   // Vertical sprite offset
+	ghoulOffsetFlip = 14   // Sprite offset when facing left
+
+	// Physics properties
+	ghoulMaxSpeed = 40.0 // Maximum horizontal velocity (pixels/second)
+	ghoulWeight   = 0.85 // Body weight for knockback calculations
+
+	// Combat stats
+	ghoulHealth = 70   // Hit points
+	ghoulPoise  = 21.0 // Knockback resistance
+	ghoulExp    = 20   // Experience points awarded on death
+
+	// Default behavior
+	ghoulDefaultRocks = 0 // Default rock count (0 = melee only)
+
+	// Visual effect durations
+	ghoulFlashDuration = 0.8 // Flash effect duration in seconds
+	ghoulDieDuration   = 1.0 // Death fade duration in seconds
 )
 
-type Ghoul struct {
-	*core.BaseEntity
-	*actor.Control
-	anim   *anim.Comp
-	body   *body.Comp
-	hitbox *hitbox.Comp
-	stats  *stats.Comp
-	ai     *ai.Comp
-	rocks  int
-}
+// NewGhoulPrefab constructs a ghoul enemy entity using the shared enemy factory.
+//
+// Ghouls are intelligent enemies with two AI modes:
+//  1. Aggressive (default): Approaches player, performs melee attacks and jump-attacks
+//  2. Poacher (if rocks > 0): Maintains distance, throws rocks, backs away from player
+//
+// Behavior phases (Aggressive mode):
+//  1. Idle: Patrols view area, detects player
+//  2. Approach: Moves toward player until in attack range
+//  3. Attack: Performs short/long attack or jump-attack
+//  4. Repeat
+//
+// Behavior phases (Poacher mode):
+//  1. Idle: Patrols view area, detects player
+//  2. BackUp: Moves away from player to maintain range
+//  3. Throw: Throws rock at player
+//  4. Recover: Pauses after throw
+//  5. Repeat (or defend if out of rocks)
+//
+// Parameters:
+//   - world: ECS world instance (required)
+//   - x, y: Spawn position in world coordinates
+//   - w, h: UNUSED (kept for tilemap compatibility, uses ghoulWidth/ghoulHeight)
+//   - flipX: Initial facing direction (true = right, false = left)
+//
+// Returns: EntityId of the created ghoul, or 0 if world is nil
+func NewGhoulPrefab(world *ecs.World, x, y, w, h float64, flipX bool) entities.EntityId {
+	config := EnemyConfig{
+		// Animation
+		AnimFile:   ghoulAnimFile,
+		OffsetX:    ghoulOffsetX,
+		OffsetY:    ghoulOffsetY,
+		OffsetFlip: ghoulOffsetFlip,
 
-func NewGhoul(x, y, _, _ float64, props *core.Properties) *Ghoul {
-	rocks, _ := strconv.Atoi(props.Custom["rocks"])
-	ghoul := &Ghoul{
-		BaseEntity: &core.BaseEntity{X: x, Y: y, W: ghoulWidth, H: ghoulHeight},
-		anim:       &anim.Comp{FilesName: ghoulAnimFile, OX: ghoulOffsetX, OY: ghoulOffsetY, OXFlip: ghoulOffsetFlip, FlipX: props.FlipX},
-		body:       &body.Comp{MaxX: ghoulMaxSpeed},
-		hitbox:     &hitbox.Comp{},
-		stats:      &stats.Comp{MaxHealth: ghoulHealth, MaxPoise: ghoulPoise, Exp: ghoulExp},
-		ai:         &ai.Comp{},
-		rocks:      rocks,
+		// Dimensions
+		Width:  ghoulWidth,
+		Height: ghoulHeight,
+
+		// Physics
+		Weight:          ghoulWeight,
+		GravityEnabled:  true,
+		FrictionEnabled: true,
+		MaxVelocityX:    ghoulMaxSpeed,
+
+		// Stats
+		Health: int(ghoulHealth),
+		Poise:  int(ghoulPoise),
+		Exp:    ghoulExp,
+
+		// Visual effects
+		FlashDuration: ghoulFlashDuration,
+		FlashColor:    [3]float32{1, 1, 1}, // White
+		DieDuration:   ghoulDieDuration,
+
+		// Detection (360° vision, 1.5x entity size in all directions)
+		DetectionFront: 13.5, // 1.5 * ghoulWidth
+		DetectionBack:  13.5,
+		DetectionUp:    19.5, // 1.5 * ghoulHeight
+		DetectionDown:  19.5,
+
+		// Optional behavior components
+		ApproachBehavior: &components.ApproachBehavior{
+			Speed:           80.0,
+			MaxSpeed:        60.0,
+			MinRange:        30.0, // Longer range than rat
+			RangeAdjustment: 0.0,
+		},
+		BackupBehavior: &components.BackupBehavior{
+			Speed:    70.0,
+			MaxRange: 40.0,
+		},
 	}
-	ghoul.Add(ghoul.anim, ghoul.body, ghoul.hitbox, ghoul.stats, ghoul.ai)
-	ghoul.Control = actor.NewControl(ghoul)
 
-	var view *bump.Rect
-	if props.View != nil {
-		viewRect := bump.NewRect(props.View.X, props.View.Y, props.View.Width, props.View.Height)
-		view = &viewRect
-	}
-	ghoul.ai.SetAct(func() { ghoul.aiScript(view, props.Custom["ai"] == "poacher") })
-
-	return ghoul
-}
-
-func (g *Ghoul) Comps() (anim *anim.Comp, body *body.Comp, hitbox *hitbox.Comp, stats *stats.Comp, ai *ai.Comp) {
-	return g.anim, g.body, g.hitbox, g.stats, g.ai
-}
-
-func (g *Ghoul) Update(dt float64) { g.SimpleUpdate(dt) }
-
-func (g *Ghoul) ThrowRock() {
-	tag := "Throw"
-	if g.anim.State == tag || g.PausingState() || g.rocks <= 0 {
-		return
-	}
-	g.anim.SetState(tag)
-	g.anim.OnFrame(ghoulThrowFrame, func() {
-		vars.World.Add(NewRock(g.X-2, g.Y-4, g))
-		g.rocks--
+	// Create enemy with Ghoul-specific component
+	return NewEnemyPrefab(world, x, y, flipX, config, &components.Ghoul{
+		Rocks:         ghoulDefaultRocks,
+		Poacher:       false,
+		ThrowCooldown: 0,
+		Paused:        false,
 	})
 }
 
-func (g *Ghoul) jumpAttackAction() *ai.Action {
-	speed := float64(skelemanSpeed)
-
-	return &ai.Action{
-		Name: "JumpAttack",
-		Entry: func() {
-			if g.PausingState() {
-				return
-			}
-			g.body.MaxX = ghoulMaxSpeed * 2
-			time.AfterFunc(1*time.Millisecond, func() { g.Control.Attack("AttackShort", skelemanDamage, 0, 10, 10) })
-			g.body.Vy = -skelemanSpeed / 2
-			g.body.Ground = false
-			if g.anim.FlipX {
-				g.body.Vx += ghoulMaxSpeed * 2
-			} else {
-				g.body.Vx -= ghoulMaxSpeed * 2
-				speed *= -1
-			}
-		},
-		Next: func(dt float64) bool {
-			if !g.PausingState() {
-				g.body.Vx += speed * dt
-			}
-
-			return g.body.Ground && g.anim.State != "AttackShort"
-		},
-		Exit: func() { g.body.MaxX = ghoulMaxSpeed },
+// SetGhoulRocks sets the number of rocks the ghoul can throw.
+func SetGhoulRocks(world *ecs.World, eid entities.EntityId, rocks int) {
+	if ghoul := ecs.GetComponent[components.Ghoul](world, eid); ghoul != nil {
+		ghoul.Rocks = rocks
 	}
 }
 
-//nolint:mnd
-func (g *Ghoul) aiScript(view *bump.Rect, poacher bool) {
-	g.ai.Add(0, actor.IdleAction(g.Control, view))
-	if poacher && g.rocks > 0 {
-		g.ai.Add(1, actor.BackUpAction(g.Control, ghoulSpeed, 0))
-		g.ai.Add(3, actor.AnimAction(g.Control, "Throw", func() { g.ThrowRock() }))
-		g.ai.Add(0.8, actor.WaitAction())
-
-		return
+// SetGhoulPoacher enables poacher AI mode for the ghoul.
+func SetGhoulPoacher(world *ecs.World, eid entities.EntityId, poacher bool) {
+	if ghoul := ecs.GetComponent[components.Ghoul](world, eid); ghoul != nil {
+		ghoul.Poacher = poacher
 	}
-	ai.Choices{
-		{0.2, func() {
-			g.ai.Add(0, actor.ApproachAction(g.Control, ghoulSpeed, ghoulMaxSpeed, 10))
-			g.ai.Add(0.1, actor.WaitAction())
-			g.ai.Add(5, g.jumpAttackAction())
-			g.ai.Add(0.2, actor.WaitAction())
-		}},
-		{1, func() {
-			g.ai.Add(0, actor.ApproachAction(g.Control, ghoulSpeed, ghoulMaxSpeed, 0))
-			g.ai.Add(0.1, actor.WaitAction())
-			ai.Choices{
-				{2, func() { g.ai.Add(5, actor.AttackAction(g.Control, "AttackShort", ghoulDamage)) }},
-				{2, func() { g.ai.Add(5, actor.AttackAction(g.Control, "AttackLong", ghoulDamage)) }},
-				{0.5, func() { g.ai.Add(1, actor.BackUpAction(g.Control, ghoulSpeed, 0)) }},
-				{1, func() { g.ai.Add(0.1, actor.WaitAction()) }},
-			}.Play()
-		}},
-	}.Play()
 }

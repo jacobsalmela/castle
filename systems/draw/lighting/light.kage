@@ -1,73 +1,61 @@
-//go:build ignore
-
 //kage:unit pixels
+
 package main
 
-// https://github.com/mattdesl/lwjgl-basics/wiki/ShaderLesson6
+// Configurable parameters (passed as uniforms from config)
+var LightPosSize vec3
+var LightIntensity float      // Brightness multiplier (1.0 = normal, 2.0 = twice as bright)
+var Time float
+var AmbientBrightness float   // Minimum light level (0.0 = pitch black, 1.0 = fully lit)
+var FlickerAmount float       // 0.0 = no flicker, 0.4 = strong candle-like (default from upstream)
+var FlickerSpeed float        // Swing speed for torch movement (1.5 Hz default)
+var LightResolution float     // Posterization bands (8.0 = upstream, lower = more bands)
+var LightResolutionOffset float // Offset for band positioning (0.8 = upstream)
+var DitherIntensity float     // Random noise/grain intensity (0.04 = upstream)
 
-const (
-	ambientLight          = 0.5
-	lightResolution       = 8
-	lightResolutionOffset = 0.8
-	swingSpeed            = 1.5
-	flickerIntensity      = 0.4
-	ditherIntensity       = 0.04
-)
-
-var (
-	Time         float
-	LightPosSize vec3
-)
-
+// Random function for dithering and flicker
 // https://gist.github.com/patriciogonzalezvivo/670c22f3966e662d2f83
 func rand(co vec2) float {
 	return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453)
 }
 
-func Fragment(dstPos vec4, srcPos vec2) vec4 {
-	lightDir := 0.1 * (LightPosSize - vec3(dstPos.xy-imageDstOrigin(), 0))
+func Fragment(dstPos vec4, srcPos vec2, color vec4) vec4 {
+	// Calculate light direction and distance from pixel to light source
+	// Coordinates are screen-space (camera-adjusted), dstPos.xy is pixel position in buffer
+	lightVec := LightPosSize - vec3(dstPos.xy, 0)
+	lightDir := normalize(lightVec)
+	distance := length(lightVec.xy)
+	
+	// Distance attenuation: light fades based on distance from center
+	// Use the light size (LightPosSize.z) as the radius
+	attenuation := clamp(1.0 - (distance / LightPosSize.z), 0.0, 1.0)
 
+	// Sample normal map
 	normalValues := imageSrc0At(srcPos).xyzw
 	normalColor := normalValues.xyz
-	normalColor.y = 1 - normalColor.y
+	normalColor.y = 1 - normalColor.y  // Flip Y for correct orientation
 	normal := normalize(normalColor*2 - 1)
-	diffuse := (1 - ambientLight) * max(dot(normal, normalize(lightDir)), 0.0)
 
-	diffuse += (cos(swingSpeed*Time) + ((rand(vec2(Time)) - 0.5) * flickerIntensity)) * 0.01
-	diffuse *= 1 + ditherIntensity*(rand(srcPos)-0.5)
-	diffuse = floor(lightResolution*diffuse+lightResolutionOffset) / lightResolution
+	// Use ambient brightness from config (0.0 = pitch black, 1.0 = fully lit)
+	ambientLight := AmbientBrightness
 
+	// Diffuse lighting with normal map, modulated by distance attenuation and intensity
+	diffuse := (1 - ambientLight) * max(dot(normal, lightDir * 0.1), 0.0) * attenuation * LightIntensity
+
+	// Add organic torch swing (slow cosine wave) and random flicker
+	diffuse += (cos(FlickerSpeed*Time) + ((rand(vec2(Time)) - 0.5) * FlickerAmount)) * 0.01
+
+	// Add dithering/grain texture for retro look
+	diffuse *= 1 + DitherIntensity*(rand(srcPos)-0.5)
+
+	// Posterize into discrete bands (pixel art style)
+	diffuse = floor(LightResolution*diffuse+LightResolutionOffset) / LightResolution
+
+	// Clamp and add ambient
 	diffuse = clamp(diffuse+ambientLight, 0, 1)
+
+	// Add unlit areas (alpha channel from normal map)
 	diffuse += 1 - normalValues.w
 
 	return vec4(diffuse, diffuse, diffuse, 1)
 }
-
-/*
-
-float rand(vec2 co) {
-	return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
-}
-
-void mainImage(out vec4 fragColor, in vec2 fragCoord) {
-    vec3 lightPos = vec3(iMouse.xy, iMouse.y);
-	vec3 lightDir = (lightPos - vec3(fragCoord, 0));
-    //fragColor = vec4(lightDir.xy, 0, 1);
-    //return;
-
-	vec3 normalColor = texture(iChannel1, fragCoord/iResolution.xy).xyz;
-	//normalColor.y = 1.0 - normalColor.y;
-	vec3 normal = normalize(2.0*normalColor - 1.0);
-	float ambient = 0.25;
-	float diffuse = (1.0 - ambient) * max(dot(normal, normalize(lightDir)), 0.0);
-
-
-    float lightResolution = 12.0;
-	//diffuse += (cos(iTime*1.5) + ((rand(vec2(iTime, iTime)) - 0.5) * 0.4)) * 0.01;
-	//float randcomp = 1.0 + (rand(fragCoord)-0.5)*0.07;
-	//diffuse *= randcomp;
-
-	diffuse = floor(diffuse*lightResolution) / lightResolution;
-	fragColor = texture(iChannel0, fragCoord/iResolution.xy) * (ambient + diffuse);
-}
-*/

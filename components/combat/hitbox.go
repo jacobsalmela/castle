@@ -1,164 +1,68 @@
-package hitbox
+package combat
 
-import (
-	"game/core"
-	"game/libs/bump"
-	"game/vars"
-	"image/color"
-	"slices"
+import "game/pkg/bump"
 
-	"github.com/hajimehoshi/ebiten/v2"
-	"github.com/lafriks/go-tiled"
-)
-
-var DebugDraw = false
-
+// ContactType defines how a hitbox interacts with other entities.
 type ContactType int
 
 const (
+	// Hit represents a hurtbox that receives damage (defensive)
 	Hit ContactType = iota
+	// Block prevents damage while still registering contact (defensive enhancement)
 	Block
+	// ParryBlock represents a parry window that can reflect damage (defensive counter)
 	ParryBlock
 )
 
-type HitFunc func(core.Entity, *bump.Collision, float64, ContactType)
+// HitboxRect represents a single collision box relative to an entity's position.
+// All coordinates are offsets from the entity's Transform position.
+// Hitbox queries CollisionSpace to find targets to damage
+type HitboxRect struct {
+	X       float64     // X offset from entity position
+	Y       float64     // Y offset from entity position
+	W       float64     // Width of hitbox
+	H       float64     // Height of hitbox
+	Contact ContactType // Interaction behavior (static)
 
+	// ContactFunc provides dynamic contact type resolution.
+	// When set, this function is called instead of using the static Contact field.
+	// Used for mechanics like knight shield parry→block transitions.
+	// Optional - most hitboxes use static Contact field.
+	ContactFunc func() ContactType
+}
+
+// ToBumpRect converts HitboxRect to bump.Rect with world position offset.
+func (r HitboxRect) ToBumpRect(entityX, entityY float64) bump.Rect {
+	return bump.Rect{
+		X: entityX + r.X,
+		Y: entityY + r.Y,
+		W: r.W,
+		H: r.H,
+	}
+}
+
+// ResolveContact returns the active ContactType for this hitbox.
+// If ContactFunc is set, it calls the function for dynamic resolution.
+// Otherwise, returns the static Contact field.
+func (r HitboxRect) ResolveContact() ContactType {
+	if r.ContactFunc != nil {
+		return r.ContactFunc()
+	}
+	return r.Contact
+}
+
+// Hitbox is a component containing collision boxes for an entity.
+// Boxes are stored as offsets from the entity's Transform position, making
+// them independent of entity location. Systems handle collision detection
+// by combining Hitbox + Transform components.
 type Hitbox struct {
-	rect              bump.Rect
-	comp              *Comp
-	contactType       ContactType
-	updateContactType func() ContactType
-}
+	// Boxes contains all active collision boxes for this entity.
+	// Typically:
+	//   - Index 0: Hurtbox (defensive, ContactType=Hit)
+	//   - Index 1+: Block boxes, attack boxes, etc.
+	Boxes []HitboxRect
 
-type Comp struct {
-	HitFunc         HitFunc
-	entity          core.Entity
-	space           *bump.Space
-	hurtBoxes       []*Hitbox
-	debugLastHitbox bump.Rect
-}
-
-func (c *Comp) Init(entity core.Entity) {
-	c.entity = entity
-	c.space = vars.World.Space
-}
-
-func (c *Comp) Remove() {
-	for c.PopHitbox() != nil { //nolint: revive
-	}
-}
-
-func (c *Comp) Update(_ float64) {
-	ex, ey := c.entity.Position()
-	for _, box := range c.hurtBoxes {
-		if box.updateContactType != nil {
-			if newContact := box.updateContactType(); newContact > 0 {
-				box.contactType = newContact
-			}
-		}
-		p := bump.Vec2{X: ex + box.rect.X, Y: ey + box.rect.Y}
-		c.space.Move(box, p, bump.NilFilter)
-	}
-}
-
-func (c *Comp) Draw(pipeline *core.Pipeline, entityPos ebiten.GeoM) {
-	if !DebugDraw {
-		return
-	}
-	pipeline.Add(vars.PipelineScreenTag, vars.PipelineUILayer, func(screen *ebiten.Image) {
-		for _, box := range c.hurtBoxes {
-			image := ebiten.NewImage(int(box.rect.W), int(box.rect.H))
-			image.Fill(color.NRGBA{0, 0, 255, 75})
-			if box.contactType != Hit {
-				image.Fill(color.NRGBA{255, 0, 0, 75})
-			}
-			op := &ebiten.DrawImageOptions{GeoM: entityPos}
-			op.GeoM.Translate(box.rect.X, box.rect.Y)
-			screen.DrawImage(image, op)
-		}
-
-		if c.debugLastHitbox.W != 0 || c.debugLastHitbox.H != 0 {
-			image := ebiten.NewImage(int(c.debugLastHitbox.W), int(c.debugLastHitbox.H))
-			image.Fill(color.NRGBA{255, 255, 0, 75})
-			op := &ebiten.DrawImageOptions{GeoM: entityPos}
-			op.GeoM.Translate(c.debugLastHitbox.X, c.debugLastHitbox.Y)
-			screen.DrawImage(image, op)
-			c.debugLastHitbox = bump.Rect{}
-		}
-	})
-}
-
-func (c *Comp) PushHitbox(rect bump.Rect, block ContactType, updateContactType func() ContactType) {
-	box := &Hitbox{rect, c, block, updateContactType}
-	c.space.Set(box, rect, "hitbox")
-	c.hurtBoxes = append(c.hurtBoxes, box)
-}
-
-func (c *Comp) PopHitbox() *Hitbox {
-	size := len(c.hurtBoxes) - 1
-	if size < 0 {
-		return nil
-	}
-	box := c.hurtBoxes[size]
-	c.space.Remove(box)
-	c.hurtBoxes = c.hurtBoxes[:size]
-
-	return box
-}
-
-func (c *Comp) HitFromHitBox(rect bump.Rect, damage float64, filterOut []*Comp) (ContactType, []*Comp) {
-	c.debugLastHitbox = rect
-	ex, ey := c.entity.Position()
-	rect.X += ex
-	rect.Y += ey
-	cols := c.space.Query(rect, c.hitFilter(), "hitbox", "map")
-
-	type contactInfo struct {
-		contactType ContactType
-		col         *bump.Collision
-	}
-
-	var contacted []*Comp
-	contact := Hit
-	doesHit := map[*Comp]contactInfo{}
-	for _, col := range cols {
-		if other, ok := col.Other.(*Hitbox); ok { //nolint: nestif
-			if slices.Contains(filterOut, other.comp) {
-				continue
-			}
-			contacted = append(contacted, other.comp)
-			if other.contactType > contact {
-				contact = other.contactType
-			}
-			if doesHit[other.comp].col == nil {
-				doesHit[other.comp] = contactInfo{Hit, col}
-			}
-			if other.contactType > doesHit[other.comp].contactType {
-				doesHit[other.comp] = contactInfo{other.contactType, col}
-			}
-		} else if _, ok := col.Other.(*tiled.Object); ok && contact < Block && !c.space.Has(col.Other, "slope") {
-			contact = Block
-		}
-	}
-
-	for comp, info := range doesHit {
-		if comp.HitFunc != nil {
-			comp.HitFunc(c.entity, info.col, damage, info.contactType)
-		}
-	}
-
-	return contact, append(filterOut, contacted...)
-}
-
-func (c *Comp) hitFilter() bump.SelectFilter {
-	return func(item bump.Item) bool {
-		if box, ok := item.(*Hitbox); ok {
-			return box.comp != c
-		}
-		if c.space.Has(item, "slope") || c.space.Has(item, "passthrough") {
-			return false
-		}
-
-		return true
-	}
+	// DebugRect stores the last attack hitbox for debug rendering.
+	// Optional - only set during active attacks for visualization.
+	DebugRect *HitboxRect
 }

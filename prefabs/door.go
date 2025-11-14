@@ -1,121 +1,154 @@
-package entity
+package prefabs
 
 import (
-	"game/assets"
-	"game/comps/body"
-	"game/comps/hitbox"
-	"game/comps/render"
-	"game/core"
-	"game/ext"
-	"game/libs/bump"
-	"game/vars"
-	"image"
+	"log"
 
-	"github.com/hajimehoshi/ebiten/v2"
-	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"game/assets"
+	"game/components"
+	"game/ecs"
+	"game/entities"
+	"game/pkg/tilemap"
 )
 
-const doorW = 3
+const (
+	// Visual properties
+	DoorWidth        = 3  // Door collision width in pixels
+	DoorRenderLayer  = -1 // Render behind player
+	DoorTileSize     = 8  // Door uses 8x8 tiles
+	DoorSpriteHeight = 24 // Door sprite is 24 pixels tall (top 8px + base 16px)
 
-var doorImage, _, _ = ebitenutil.NewImageFromFileSystem(assets.FS, "door.png")
+	// Collision configuration
+	DoorCollisionTag = "solid" // Tag for solid collision
+)
 
-type Door struct {
-	*core.BaseEntity
-	render         *render.Comp
-	body           *body.Comp
-	hitbox         *hitbox.Comp
-	open           bool
-	opensFromRight bool
-}
+// NewDoorPrefab constructs a Door entity.
+//
+// Doors are interactive barriers that can be opened by player attacks.
+// They have a 2-state lifecycle:
+//  1. Closed: Solid collision, visible hitbox, can be hit
+//  2. Open: No collision, no hitbox, triggers door chain
+//
+// Parameters:
+//   - world: ECS world instance (required)
+//   - x, y: Spawn position in world coordinates
+//   - w, h: Door dimensions (width enforced to DoorWidth, height minimum DoorSpriteHeight)
+//   - p: Tilemap properties (FlipX for direction, Custom["open"] for pre-opened state)
+//
+// Returns: EntityId of the created door, or 0 if world is nil
+func NewDoorPrefab(world *ecs.World, x, y, w, h float64, p *tilemap.Properties) entities.EntityId {
+	if world == nil {
+		return 0
+	}
 
-func NewDoor(x, y, _, h float64, props *core.Properties) *Door {
+	// Force door height to match sprite height (3 tiles = 24px)
+	// Door objects in Tiled may be taller, but visual/collision should match sprite
+	h = DoorSpriteHeight
+
+	// Calculate image offset for flipped doors
 	imageOffset := 0.0
-	if props.FlipX {
-		imageOffset = -tileSize + doorW
+	opensFromRight := false
+	if p != nil && p.FlipX {
+		imageOffset = -TileSize + DoorWidth
 		x -= imageOffset
+		opensFromRight = true
 	}
-	door := &Door{
-		BaseEntity:     &core.BaseEntity{X: x, Y: y, W: doorW, H: h},
-		render:         &render.Comp{X: imageOffset, FlipX: props.FlipX, Layer: -1},
-		body:           &body.Comp{NoUpdate: true, Tags: []bump.Tag{"solid"}},
-		hitbox:         &hitbox.Comp{},
-		opensFromRight: props.FlipX,
-		open:           props.Custom["open"] == "true",
-	}
-	door.Add(door.render, door.body, door.hitbox)
-	door.setImage()
 
-	return door
+	// Determine if door starts open
+	startOpen := false
+	if p != nil && p.Custom != nil {
+		startOpen = p.Custom["open"] == "true"
+	}
+
+	// Create the entity
+	entityID := world.NewEntity()
+
+	// === SPATIAL COMPONENT ===
+	// Position and dimensions in world space
+	transform := &components.Transform{
+		X: x,
+		Y: y,
+		W: DoorWidth,
+		H: h,
+	}
+	world.AddComponent(entityID, transform)
+
+	// === VISUAL COMPONENT ===
+	// Render with sprite (Animation will update the frame)
+	render := &components.Render{
+		X:     imageOffset,
+		FlipX: opensFromRight,
+		Layer: DoorRenderLayer,
+		Image: assets.GetSpriteImage("door"),
+	}
+	world.AddComponent(entityID, render)
+
+	// === ANIMATION COMPONENT ===
+	// Door uses Aseprite animation with two states:
+	//   - "idle": Closed door (frame 0, initial state)
+	//   - "open": Open door (frame 1, final state after activation)
+	anim := &components.Animation{
+		FilesName:  "door",
+		State:      "idle", // Start in idle state (closed door)
+		FSMInitial: "idle",
+		FSMTransitions: map[string]string{
+			"activate": "open", // Opening animation transitions to open state
+			"open":     "open", // Stay in open state (prevents returning to idle)
+		},
+		OX: 0, OY: 0, // No offsets needed for door
+		OXFlip: 0, OYFlip: 0,
+		Layer: DoorRenderLayer,
+	}
+	// Always add the animation component (needed for OpenDoor system)
+	world.AddComponent(entityID, anim)
+
+	// Initialize the animation data
+	if err := InitializeAnimation(anim); err != nil {
+		// Log warning but continue - door will still be functional
+		log.Printf("Warning: Failed to initialize door animation: %v", err)
+	}
+
+	// === NEW COLLIDER COMPONENT (Phase 2) ===
+	// Static collider - door is immovable solid barrier (until opened)
+	collider := &components.Collider{
+		Tags:      []string{DoorCollisionTag}, // Solid collision
+		QueryTags: []string{},
+		Solid:     !startOpen, // Start non-solid if pre-opened
+		Immovable: true,       // Static object
+		OffsetX:   0,
+		OffsetY:   0,
+		Width:     0, // Use Transform size
+		Height:    0, // Use Transform size
+		FilterOut: []entities.EntityId{},
+	}
+	world.AddComponent(entityID, collider)
+
+	// Register in collision space (done automatically by physics system)
+
+	// === HITBOX COMPONENT ===
+	// Hitbox so the door can be hit by attacks (offset-based, relative to transform)
+	hitbox := NewHitbox(0, 0, DoorWidth, h)
+	world.AddComponent(entityID, hitbox)
+
+	// === TEAM COMPONENT ===
+	// Team affiliation (neutral, not player or enemy)
+	world.AddComponent(entityID, &components.Team{Type: components.TeamNeutral})
+
+	// === BEHAVIOR COMPONENT ===
+	// Door-specific state
+	door := &components.Door{
+		Opened:         startOpen, // Set initial state
+		OpensFromRight: opensFromRight,
+		Height:         h,
+		NeedsInit:      startOpen, // System will apply open state (Pure ECS)
+	}
+	world.AddComponent(entityID, door)
+
+	return entityID
 }
 
-func (d *Door) Init() {
-	d.hitbox.HitFunc = d.doorHurt
-	d.hitbox.PushHitbox(bump.Rect{W: doorW, H: d.H}, hitbox.Hit, nil)
-	if d.open {
-		d.open = false
-		d.Open()
-	}
-}
-
-func (d *Door) Update(_ float64) {}
-
-func (d *Door) Opened() bool { return d.open }
-
-func (d *Door) Open() {
-	if d.open {
-		return
-	}
-	d.open = true
-	d.body.Remove()
-	d.hitbox.Remove()
-	d.setImage()
-	// Open subsequent doors.
-	for _, door := range ext.QueryFront(d, tileSize, d.H/2, !d.opensFromRight) {
-		door.Open()
-	}
-}
-
-func (d *Door) Close() {
-	if !d.open {
-		return
-	}
-	d.open = false
-	d.body.Init(d)
-	d.hitbox.Init(d)
-	d.setImage()
-	// Close subsequent doors.
-	for _, door := range ext.QueryFront(d, tileSize, d.H/2, !d.opensFromRight) {
-		door.Close()
-	}
-}
-
-func (d *Door) setImage() {
-	img := ebiten.NewImage(tileSize, int(d.H))
-	w := 0
-	if d.open {
-		w = tileSize
-	}
-	doorTop := doorImage.SubImage(image.Rect(w, 0, w+tileSize, tileSize)).(*ebiten.Image)
-	doorFill := doorImage.SubImage(image.Rect(w, 2*tileSize, w+tileSize, 3*tileSize)).(*ebiten.Image)
-	doorBase := doorImage.SubImage(image.Rect(w, tileSize, w+tileSize, 3*tileSize)).(*ebiten.Image)
-	op := &ebiten.DrawImageOptions{}
-	img.DrawImage(doorTop, op)
-	op.GeoM.Translate(0, tileSize)
-
-	for size := d.H - tileSize; size > 2*tileSize; size -= tileSize {
-		img.DrawImage(doorFill, op)
-		op.GeoM.Translate(0, tileSize)
-	}
-	img.DrawImage(doorBase, op)
-	d.render.Image = img
-}
-
-func (d *Door) doorHurt(other core.Entity, _ *bump.Collision, _ float64, _ hitbox.ContactType) {
-	if d.open || !core.GetFlag(other, vars.PlayerTeamFlag) {
-		return
-	}
-	ox, _ := other.Position()
-	if d.opensFromRight && ox > d.X || !d.opensFromRight && ox < d.X {
-		d.Open()
-	}
+func init() {
+	// Door registration happens in game/game_vars.go line 151 via entity map:
+	// 151: func(world *ecs.World, x, y, w, h float64, p *tilemap.Properties) entities.EntityId {
+	//     return prefabs.NewDoorPrefab(world, x, y, w, h, p)
+	// }
 }
